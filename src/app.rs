@@ -71,6 +71,8 @@ pub struct NovelQuillApp {
     ai_prompt: String,
     ai_output: String,
     ai_comparison_original: String,
+    ai_comparison_ai: String,
+    ai_generation_action: AiAction,
     ai_action: AiAction,
     continue_length: ContinueLength,
     cursor_char: Option<usize>,
@@ -149,6 +151,8 @@ impl NovelQuillApp {
             ai_prompt: String::new(),
             ai_output: String::new(),
             ai_comparison_original: String::new(),
+            ai_comparison_ai: String::new(),
+            ai_generation_action: AiAction::Continue,
             ai_action: AiAction::Continue,
             continue_length: ContinueLength::Paragraph,
             cursor_char: None,
@@ -334,9 +338,9 @@ impl NovelQuillApp {
             let end = char_to_byte_index(&document.content, end);
             document.content[start..end].to_owned()
         });
-        self.ai_comparison_original = selected_text
-            .clone()
-            .unwrap_or_else(|| document.content.clone());
+        self.ai_comparison_original = document.content.clone();
+        self.ai_comparison_ai.clear();
+        self.ai_generation_action = self.ai_action;
         let mut manuscript_at_cursor = document.content.clone();
         manuscript_at_cursor.insert_str(cursor_byte, "<<<CURSOR>>>");
         self.ai_insert_target = Some((document.path.clone(), cursor_char));
@@ -587,6 +591,60 @@ impl NovelQuillApp {
         } else {
             self.status = "The document for that AI edit is no longer open".into();
         }
+    }
+
+    fn compose_ai_document_version(&mut self) {
+        let mut version = self.ai_comparison_original.clone();
+        if self.ai_generation_action == AiAction::Continue {
+            if let Some((_, cursor_char)) = &self.ai_insert_target {
+                let byte = char_to_byte_index(&version, *cursor_char);
+                let insertion =
+                    ai_insertion_text(&version, byte, self.ai_output.trim(), self.continue_length);
+                version.insert_str(byte, &insertion);
+            }
+        } else if let Some((_, start_char, end_char)) = &self.ai_replace_target {
+            let start = char_to_byte_index(&version, *start_char);
+            let end = char_to_byte_index(&version, *end_char);
+            version.replace_range(start..end, self.ai_output.trim());
+        } else {
+            version = self.ai_output.clone();
+        }
+        self.ai_comparison_ai = version;
+    }
+
+    fn accept_ai_document_version(&mut self) {
+        let path = self
+            .ai_replace_target
+            .as_ref()
+            .map(|target| target.0.clone())
+            .or_else(|| {
+                self.ai_insert_target
+                    .as_ref()
+                    .map(|target| target.0.clone())
+            })
+            .or_else(|| {
+                self.active
+                    .and_then(|index| self.documents.get(index))
+                    .map(|document| document.path.clone())
+            });
+        let Some(path) = path else { return };
+        let Some(index) = self
+            .documents
+            .iter()
+            .position(|document| document.path == path)
+        else {
+            self.status = "The handwritten document is no longer open".into();
+            return;
+        };
+        self.ai_undo_stack
+            .push((path, self.documents[index].content.clone()));
+        self.documents[index]
+            .content
+            .clone_from(&self.ai_comparison_ai);
+        self.active = Some(index);
+        self.last_edit = Instant::now();
+        self.status =
+            "Accepted the complete AI-assisted version; Undo AI edit remains available".into();
     }
 
     fn poll_ollama(&mut self, ctx: &egui::Context) {
@@ -1892,6 +1950,7 @@ impl NovelQuillApp {
                     .add_enabled(has_output, egui::Button::new("Compare side by side"))
                     .clicked()
                 {
+                    self.compose_ai_document_version();
                     self.show_ai_compare = true;
                 }
                 if ui
@@ -2326,56 +2385,42 @@ impl NovelQuillApp {
             let mut open = self.show_ai_compare;
             let mut action = None;
             let mut original = self.ai_comparison_original.clone();
-            egui::Window::new("Original ↔ AI comparison")
+            egui::Window::new("Handwritten ↔ AI-assisted comparison")
                 .open(&mut open)
                 .default_width(1100.0)
                 .default_height(700.0)
                 .show(ctx, |ui| {
                     ui.columns(2, |columns| {
-                        columns[0].heading("Original version");
+                        columns[0].heading("Handwritten version — protected");
                         columns[0].add(
                             egui::TextEdit::multiline(&mut original)
                                 .desired_width(f32::INFINITY)
                                 .desired_rows(30)
                                 .interactive(false),
                         );
-                        columns[1].heading("AI version — editable");
+                        columns[1].heading("AI-assisted version — editable");
                         columns[1].add(
-                            egui::TextEdit::multiline(&mut self.ai_output)
+                            egui::TextEdit::multiline(&mut self.ai_comparison_ai)
                                 .desired_width(f32::INFINITY)
                                 .desired_rows(30),
                         );
                     });
                     ui.separator();
                     ui.horizontal(|ui| {
-                        if ui
-                            .add_enabled(
-                                self.ai_replace_target.is_some(),
-                                egui::Button::new("Accept as selection replacement"),
-                            )
-                            .clicked()
-                        {
+                        if ui.button("Use AI-assisted version").clicked() {
                             action = Some(1);
                         }
-                        if ui.button("Insert at original cursor").clicked() {
-                            action = Some(2);
-                        }
-                        if ui.button("Replace entire document").clicked() {
-                            self.ai_replace_target = None;
-                            action = Some(1);
-                        }
-                        if ui.button("Keep original").clicked() {
+                        if ui.button("Keep handwritten version").clicked() {
                             action = Some(3);
+                        }
+                        if ui.button("Copy AI-assisted version").clicked() {
+                            ui.ctx().copy_text(self.ai_comparison_ai.clone());
                         }
                     });
                 });
             match action {
                 Some(1) => {
-                    self.replace_ai_target();
-                    open = false;
-                }
-                Some(2) => {
-                    self.insert_ai_at_cursor();
+                    self.accept_ai_document_version();
                     open = false;
                 }
                 Some(3) => open = false,
@@ -2471,6 +2516,42 @@ fn char_to_byte_index(text: &str, char_index: usize) -> usize {
         .nth(char_index)
         .map(|(byte_index, _)| byte_index)
         .unwrap_or(text.len())
+}
+
+fn ai_insertion_text(
+    document: &str,
+    byte_index: usize,
+    generated: &str,
+    length: ContinueLength,
+) -> String {
+    let before = &document[..byte_index];
+    let after = &document[byte_index..];
+    let mut insertion = String::new();
+    match length {
+        ContinueLength::Sentence => {
+            if !before.is_empty() && !before.ends_with(char::is_whitespace) {
+                insertion.push(' ');
+            }
+            insertion.push_str(generated);
+            if !after.is_empty() && !after.starts_with(char::is_whitespace) {
+                insertion.push(' ');
+            }
+        }
+        ContinueLength::Paragraph => {
+            if !before.is_empty() && !before.ends_with("\n\n") {
+                insertion.push_str(if before.ends_with('\n') { "\n" } else { "\n\n" });
+            }
+            insertion.push_str(generated);
+            if !after.is_empty() && !after.starts_with("\n\n") {
+                insertion.push_str(if after.starts_with('\n') {
+                    "\n"
+                } else {
+                    "\n\n"
+                });
+            }
+        }
+    }
+    insertion
 }
 
 fn markdown_layout_job(text: &str, font_size: f32) -> egui::text::LayoutJob {

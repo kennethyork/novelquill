@@ -15,7 +15,7 @@ A local-first desktop novel-writing studio built in Rust. Manuscripts remain ord
 - **Story-aware Ollama:** streamed local generation with Sentence/Paragraph continuation at the cursor, selection replacement, rewrite, brainstorm, summary, critique, scene-beat extraction and custom instructions.
 - **Transparent AI context:** relevant Codex facts, scene metadata, previous summaries, plot threads and the project style guide are assembled automatically. The exact prompt remains inspectable and copyable.
 - **Generation history:** reopen the last 20 responses and review or edit every suggestion before insertion.
-- **Side-by-side AI review:** preserve the exact original source beside an editable AI version, then accept it as a selection replacement, insert it at the cursor, replace the document, or keep the original. Applied AI edits have a dedicated one-click undo stack.
+- **Handwritten vs AI review:** preserve the complete handwritten document beside a complete, editable AI-assisted version. Cursor continuations and selection rewrites are composed into the cloned AI document first; the handwritten version is untouched until explicitly replaced. Applied AI versions have a dedicated one-click undo stack.
 - **Publishing:** filter manuscript content through a saved build profile and export Markdown, PDF, DOCX, ODT, EPUB or styled HTML.
 - **Preferences:** Ollama endpoint/model, creativity, font size, autosave and novel word target, with automatic last-project reopening.
 

@@ -9,6 +9,7 @@ A local-first desktop novel-writing studio built in Rust. Manuscripts remain ord
 - **Planning:** scene synopsis, POV, location, story time, characters, plot threads, beats, tags and word targets. Switch the Outline workspace among Cards, Matrix and Timeline views.
 - **Codex:** characters, locations, lore or custom categories with aliases, descriptions, relationships, progressions, automatic manuscript mentions and AI inclusion controls.
 - **Writing:** centered Markdown editor, formatting helpers, Write/Preview/Split modes, focus mode, autosave, find/replace and manuscript/chapter word targets.
+- **Copy comparison:** use the `⇄` action beside any manuscript file to open that document as an editable copy beside the current document. Both sides retain independent contents and autosave safely.
 - **Safety:** atomic file replacement and up to 50 automatic pre-save revisions per document, with an in-app restore browser.
 - **Project search:** search every Markdown or text document and jump directly to each result.
 - **Review:** average sentence length, dialogue estimate, TODO count, frequent words, POV distribution, metadata gaps and unfinished-scene reporting.

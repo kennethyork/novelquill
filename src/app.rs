@@ -1073,6 +1073,7 @@ impl NovelQuillApp {
             .unwrap_or_default();
         let mut move_action = None;
         let mut duplicate_path = None;
+        let mut pin_path = None;
         egui::ScrollArea::vertical().show(ui, |ui| {
             for entry in entries {
                 let name = entry
@@ -1118,12 +1119,11 @@ impl NovelQuillApp {
                         open_path = Some(entry.path.clone());
                     }
                     if ui
-                        .small_button("P")
-                        .on_hover_text("Pin in split reference view")
+                        .small_button("⇄")
+                        .on_hover_text("Open this copy side by side")
                         .clicked()
                     {
-                        self.pinned_document = Some(entry.path.clone());
-                        self.center_view = CenterView::Split;
+                        pin_path = Some(entry.path.clone());
                     }
                     if active {
                         if ui
@@ -1157,7 +1157,31 @@ impl NovelQuillApp {
                 Err(error) => self.status = error.to_string(),
             }
         }
+        if let Some(path) = pin_path {
+            self.open_side_by_side(path);
+        }
         open_path
+    }
+
+    fn open_side_by_side(&mut self, path: PathBuf) {
+        let previous_active = self.active;
+        if !self.documents.iter().any(|document| document.path == path) {
+            match Document::open(path.clone()) {
+                Ok(document) => self.documents.push(document),
+                Err(error) => {
+                    self.status = error.to_string();
+                    return;
+                }
+            }
+        }
+        self.active = previous_active.or_else(|| {
+            self.documents
+                .iter()
+                .position(|document| document.path == path)
+        });
+        self.pinned_document = Some(path);
+        self.center_view = CenterView::Split;
+        self.status = "Opened editable document copies side by side".into();
     }
 
     fn sidebar_outline(&mut self, ui: &mut egui::Ui) -> Option<PathBuf> {
@@ -1731,38 +1755,52 @@ impl NovelQuillApp {
         }
         let font_size = self.settings.font_size;
         match self.center_view {
-            CenterView::Editor => self.editor_pane(ui, index, font_size),
+            CenterView::Editor => self.editor_pane(ui, index, font_size, "main-editor", true),
             CenterView::Preview => {
                 let content = self.documents[index].content.clone();
                 markdown_preview(ui, &content);
             }
             CenterView::Split => {
-                let content = self
-                    .pinned_document
-                    .as_ref()
-                    .and_then(|path| {
-                        self.documents
-                            .iter()
-                            .find(|document| document.path == path.as_path())
-                            .map(|document| document.content.clone())
-                            .or_else(|| fs::read_to_string(path).ok())
-                    })
-                    .unwrap_or_else(|| self.documents[index].content.clone());
-                ui.columns(2, |columns| {
-                    self.editor_pane(&mut columns[0], index, font_size);
-                    if let Some(path) = &self.pinned_document {
+                let pinned_index = self.pinned_document.as_ref().and_then(|path| {
+                    self.documents
+                        .iter()
+                        .position(|document| document.path == path.as_path())
+                });
+                if let Some(pinned_index) = pinned_index.filter(|pinned| *pinned != index) {
+                    ui.columns(2, |columns| {
+                        columns[0].label(
+                            RichText::new(format!("Current: {}", self.documents[index].title()))
+                                .strong(),
+                        );
+                        self.editor_pane(
+                            &mut columns[0],
+                            index,
+                            font_size,
+                            "left-copy-editor",
+                            true,
+                        );
                         columns[1].label(
                             RichText::new(format!(
-                                "Pinned: {}",
-                                path.file_name()
-                                    .and_then(|value| value.to_str())
-                                    .unwrap_or("reference")
+                                "Compared copy: {}",
+                                self.documents[pinned_index].title()
                             ))
                             .strong(),
                         );
-                    }
-                    markdown_preview(&mut columns[1], &content);
-                });
+                        self.editor_pane(
+                            &mut columns[1],
+                            pinned_index,
+                            font_size,
+                            "right-copy-editor",
+                            false,
+                        );
+                    });
+                } else {
+                    let content = self.documents[index].content.clone();
+                    ui.columns(2, |columns| {
+                        self.editor_pane(&mut columns[0], index, font_size, "left-editor", true);
+                        markdown_preview(&mut columns[1], &content);
+                    });
+                }
             }
         }
     }
@@ -1817,9 +1855,16 @@ impl NovelQuillApp {
         }
     }
 
-    fn editor_pane(&mut self, ui: &mut egui::Ui, index: usize, font_size: f32) {
+    fn editor_pane(
+        &mut self,
+        ui: &mut egui::Ui,
+        index: usize,
+        font_size: f32,
+        scroll_id: &str,
+        track_cursor: bool,
+    ) {
         egui::ScrollArea::vertical()
-            .id_salt("editor-scroll")
+            .id_salt(scroll_id)
             .show(ui, |ui| {
                 let width = (ui.available_width() - 32.0).clamp(300.0, 850.0);
                 ui.horizontal(|ui| {
@@ -1841,7 +1886,7 @@ impl NovelQuillApp {
                     if output.response.changed() {
                         self.last_edit = Instant::now();
                     }
-                    if let Some(cursor_range) = output.cursor_range {
+                    if track_cursor && let Some(cursor_range) = output.cursor_range {
                         self.cursor_char = Some(cursor_range.primary.ccursor.index);
                         let primary = cursor_range.primary.ccursor.index;
                         let secondary = cursor_range.secondary.ccursor.index;
@@ -2436,12 +2481,9 @@ impl eframe::App for NovelQuillApp {
         self.poll_ollama(ctx);
         self.handle_shortcuts(ctx);
         if self.settings.autosave && self.last_edit.elapsed() > Duration::from_secs(2) {
-            let dirty = self
-                .active
-                .and_then(|i| self.documents.get(i))
-                .is_some_and(Document::is_dirty);
-            if dirty {
-                self.save_active();
+            if self.documents.iter().any(Document::is_dirty) {
+                self.save_all();
+                self.status = "Autosaved all edited document copies".into();
             }
             self.last_edit = Instant::now();
         }

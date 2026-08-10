@@ -70,6 +70,7 @@ pub struct NovelQuillApp {
     models: Vec<String>,
     ai_prompt: String,
     ai_output: String,
+    ai_comparison_original: String,
     ai_action: AiAction,
     continue_length: ContinueLength,
     cursor_char: Option<usize>,
@@ -100,12 +101,14 @@ pub struct NovelQuillApp {
     show_trash: bool,
     show_find_replace: bool,
     show_prompt_preview: bool,
+    show_ai_compare: bool,
     find_text: String,
     replace_text: String,
     rename_name: String,
     prompt_preview: String,
     generation_history: Vec<String>,
     generation_was_chat: bool,
+    ai_undo_stack: Vec<(PathBuf, String)>,
     focus_mode: bool,
     last_edit: Instant,
     session_started: Instant,
@@ -145,6 +148,7 @@ impl NovelQuillApp {
             models: vec![],
             ai_prompt: String::new(),
             ai_output: String::new(),
+            ai_comparison_original: String::new(),
             ai_action: AiAction::Continue,
             continue_length: ContinueLength::Paragraph,
             cursor_char: None,
@@ -175,12 +179,14 @@ impl NovelQuillApp {
             show_trash: false,
             show_find_replace: false,
             show_prompt_preview: false,
+            show_ai_compare: false,
             find_text: String::new(),
             replace_text: String::new(),
             rename_name: String::new(),
             prompt_preview: String::new(),
             generation_history: vec![],
             generation_was_chat: false,
+            ai_undo_stack: vec![],
             focus_mode: false,
             last_edit: Instant::now(),
             session_started: Instant::now(),
@@ -328,6 +334,9 @@ impl NovelQuillApp {
             let end = char_to_byte_index(&document.content, end);
             document.content[start..end].to_owned()
         });
+        self.ai_comparison_original = selected_text
+            .clone()
+            .unwrap_or_else(|| document.content.clone());
         let mut manuscript_at_cursor = document.content.clone();
         manuscript_at_cursor.insert_str(cursor_byte, "<<<CURSOR>>>");
         self.ai_insert_target = Some((document.path.clone(), cursor_char));
@@ -490,6 +499,8 @@ impl NovelQuillApp {
             self.status = "The document used for this suggestion is no longer open".into();
             return;
         };
+        self.ai_undo_stack
+            .push((path.clone(), self.documents[index].content.clone()));
         let document = &mut self.documents[index];
         let byte_index = char_to_byte_index(&document.content, cursor_char);
         let before = &document.content[..byte_index];
@@ -534,6 +545,8 @@ impl NovelQuillApp {
                 .iter()
                 .position(|document| document.path == path)
         {
+            self.ai_undo_stack
+                .push((path.clone(), self.documents[index].content.clone()));
             let start = char_to_byte_index(&self.documents[index].content, start_char);
             let end = char_to_byte_index(&self.documents[index].content, end_char);
             self.documents[index]
@@ -546,10 +559,33 @@ impl NovelQuillApp {
             self.status = "Selection replaced; use History or Undo if needed".into();
             return;
         }
-        if let Some(document) = self.active.and_then(|index| self.documents.get_mut(index)) {
+        if let Some(index) = self.active {
+            let path = self.documents[index].path.clone();
+            self.ai_undo_stack
+                .push((path, self.documents[index].content.clone()));
+            let document = &mut self.documents[index];
             document.content = self.ai_output.trim().to_owned() + "\n";
             self.last_edit = Instant::now();
             self.status = "Document replaced; use History or Undo if needed".into();
+        }
+    }
+
+    fn undo_last_ai_edit(&mut self) {
+        let Some((path, content)) = self.ai_undo_stack.pop() else {
+            self.status = "No AI edit to undo".into();
+            return;
+        };
+        if let Some(index) = self
+            .documents
+            .iter()
+            .position(|document| document.path == path)
+        {
+            self.documents[index].content = content;
+            self.active = Some(index);
+            self.last_edit = Instant::now();
+            self.status = "Restored the document from before the AI edit".into();
+        } else {
+            self.status = "The document for that AI edit is no longer open".into();
         }
     }
 
@@ -1852,6 +1888,18 @@ impl NovelQuillApp {
                 if ui.add_enabled(has_output, egui::Button::new(replace_label)).clicked() {
                     self.replace_ai_target();
                 }
+                if ui
+                    .add_enabled(has_output, egui::Button::new("Compare side by side"))
+                    .clicked()
+                {
+                    self.show_ai_compare = true;
+                }
+                if ui
+                    .add_enabled(!self.ai_undo_stack.is_empty(), egui::Button::new("Undo AI edit"))
+                    .clicked()
+                {
+                    self.undo_last_ai_edit();
+                }
                 if ui.add_enabled(has_output, egui::Button::new("Copy")).clicked() { ui.ctx().copy_text(self.ai_output.clone()); }
                 if ui.add_enabled(has_output, egui::Button::new("Clear")).clicked() { self.ai_output.clear(); }
             });
@@ -2273,6 +2321,67 @@ impl NovelQuillApp {
                     }
                 });
             self.show_prompt_preview = open;
+        }
+        if self.show_ai_compare {
+            let mut open = self.show_ai_compare;
+            let mut action = None;
+            let mut original = self.ai_comparison_original.clone();
+            egui::Window::new("Original ↔ AI comparison")
+                .open(&mut open)
+                .default_width(1100.0)
+                .default_height(700.0)
+                .show(ctx, |ui| {
+                    ui.columns(2, |columns| {
+                        columns[0].heading("Original version");
+                        columns[0].add(
+                            egui::TextEdit::multiline(&mut original)
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(30)
+                                .interactive(false),
+                        );
+                        columns[1].heading("AI version — editable");
+                        columns[1].add(
+                            egui::TextEdit::multiline(&mut self.ai_output)
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(30),
+                        );
+                    });
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(
+                                self.ai_replace_target.is_some(),
+                                egui::Button::new("Accept as selection replacement"),
+                            )
+                            .clicked()
+                        {
+                            action = Some(1);
+                        }
+                        if ui.button("Insert at original cursor").clicked() {
+                            action = Some(2);
+                        }
+                        if ui.button("Replace entire document").clicked() {
+                            self.ai_replace_target = None;
+                            action = Some(1);
+                        }
+                        if ui.button("Keep original").clicked() {
+                            action = Some(3);
+                        }
+                    });
+                });
+            match action {
+                Some(1) => {
+                    self.replace_ai_target();
+                    open = false;
+                }
+                Some(2) => {
+                    self.insert_ai_at_cursor();
+                    open = false;
+                }
+                Some(3) => open = false,
+                _ => {}
+            }
+            self.show_ai_compare = open;
         }
     }
 }

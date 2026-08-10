@@ -805,7 +805,9 @@ mod tests {
     use super::*;
 
     fn test_root(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("novel-quill-{name}-{}", std::process::id()))
+        let path = std::env::temp_dir().join(format!("novel-quill-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&path);
+        path
     }
 
     #[test]

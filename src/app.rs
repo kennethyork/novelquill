@@ -1,9 +1,15 @@
 use crate::{
-    model::{ChatMessage, CodexEntry, Document, DocumentKind, Project, Settings},
+    model::{
+        ChatMessage, CodexEntry, Document, DocumentKind, Project, PromptPreset, RecoveryItem,
+        Settings,
+    },
     ollama::{GenerateRequest, OllamaClient, OllamaRequest, OllamaResponse},
+    updates::{UpdateChecker, UpdateStatus},
 };
 use eframe::egui::{self, Color32, FontId, RichText, TextStyle};
+use serde::Deserialize;
 use std::{
+    collections::HashSet,
     fs,
     io::Write,
     path::PathBuf,
@@ -28,8 +34,25 @@ enum AiAction {
     Summarize,
     Critique,
     SceneBeats,
+    Extract,
     Chat,
     Custom,
+}
+
+impl AiAction {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Continue => "Continue at cursor",
+            Self::Rewrite => "Rewrite selection",
+            Self::Brainstorm => "Brainstorm ideas",
+            Self::Summarize => "Summarize scene",
+            Self::Critique => "Critique scene",
+            Self::SceneBeats => "Extract scene beats",
+            Self::Extract => "Update story data",
+            Self::Chat => "Story chat",
+            Self::Custom => "Custom instruction",
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -61,12 +84,37 @@ struct SearchHit {
     excerpt: String,
 }
 
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+struct SceneExtraction {
+    synopsis: String,
+    pov: String,
+    location: String,
+    story_time: String,
+    tags: Vec<String>,
+    characters: Vec<String>,
+    plot_threads: Vec<String>,
+    beats: String,
+    codex: Vec<ExtractedCodex>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+struct ExtractedCodex {
+    name: String,
+    category: String,
+    description: String,
+}
+
 pub struct NovelQuillApp {
     project: Option<Project>,
     documents: Vec<Document>,
     active: Option<usize>,
     settings: Settings,
     ollama: OllamaClient,
+    updates: UpdateChecker,
+    update_available: Option<(String, String)>,
+    manual_update_check: bool,
     models: Vec<String>,
     ai_prompt: String,
     ai_output: String,
@@ -80,6 +128,7 @@ pub struct NovelQuillApp {
     pinned_document: Option<PathBuf>,
     ai_insert_target: Option<(PathBuf, usize)>,
     ai_replace_target: Option<(PathBuf, usize, usize)>,
+    ai_target_snapshot: Option<(PathBuf, String)>,
     ai_busy: bool,
     ai_panel: bool,
     left_panel: bool,
@@ -101,9 +150,11 @@ pub struct NovelQuillApp {
     show_revisions: bool,
     show_rename: bool,
     show_trash: bool,
+    show_recovery: bool,
     show_find_replace: bool,
     show_prompt_preview: bool,
     show_ai_compare: bool,
+    pending_trash: Option<PathBuf>,
     find_text: String,
     replace_text: String,
     rename_name: String,
@@ -111,8 +162,13 @@ pub struct NovelQuillApp {
     generation_history: Vec<String>,
     generation_was_chat: bool,
     ai_undo_stack: Vec<(PathBuf, String)>,
+    last_generation_request: Option<GenerateRequest>,
+    alternatives_remaining: usize,
+    selected_prompt_preset: Option<usize>,
+    prompt_preset_name: String,
     focus_mode: bool,
     last_edit: Instant,
+    last_recovery: Instant,
     session_started: Instant,
     session_start_words: usize,
 }
@@ -137,16 +193,27 @@ impl NovelQuillApp {
                     .sum()
             })
             .unwrap_or(0);
+        let show_recovery = project
+            .as_ref()
+            .and_then(|project| project.recovery_items().ok())
+            .is_some_and(|items| !items.is_empty());
         let ollama = OllamaClient::new();
         ollama.send(OllamaRequest::ListModels {
             base_url: settings.ollama_url.clone(),
         });
+        let updates = UpdateChecker::new();
+        if settings.check_updates {
+            updates.check();
+        }
         Self {
             project,
             documents: vec![],
             active: None,
             settings,
             ollama,
+            updates,
+            update_available: None,
+            manual_update_check: false,
             models: vec![],
             ai_prompt: String::new(),
             ai_output: String::new(),
@@ -160,6 +227,7 @@ impl NovelQuillApp {
             pinned_document: None,
             ai_insert_target: None,
             ai_replace_target: None,
+            ai_target_snapshot: None,
             ai_busy: false,
             ai_panel: true,
             left_panel: true,
@@ -181,9 +249,11 @@ impl NovelQuillApp {
             show_revisions: false,
             show_rename: false,
             show_trash: false,
+            show_recovery,
             show_find_replace: false,
             show_prompt_preview: false,
             show_ai_compare: false,
+            pending_trash: None,
             find_text: String::new(),
             replace_text: String::new(),
             rename_name: String::new(),
@@ -191,14 +261,32 @@ impl NovelQuillApp {
             generation_history: vec![],
             generation_was_chat: false,
             ai_undo_stack: vec![],
+            last_generation_request: None,
+            alternatives_remaining: 0,
+            selected_prompt_preset: None,
+            prompt_preset_name: String::new(),
             focus_mode: false,
             last_edit: Instant::now(),
+            last_recovery: Instant::now(),
             session_started: Instant::now(),
             session_start_words,
         }
     }
 
     fn open_project(&mut self, path: PathBuf) {
+        if self
+            .project
+            .as_ref()
+            .is_some_and(|project| project.root == path)
+        {
+            if let Some(project) = &mut self.project {
+                match project.refresh() {
+                    Ok(()) => self.status = format!("Refreshed {}", project.name()),
+                    Err(error) => self.status = error.to_string(),
+                }
+            }
+            return;
+        }
         match Project::open(path) {
             Ok(project) => {
                 self.save_all();
@@ -208,6 +296,11 @@ impl NovelQuillApp {
                 let _ = self.settings.save();
                 self.status = format!("Opened {}", project.name());
                 self.project = Some(project);
+                self.show_recovery = self
+                    .project
+                    .as_ref()
+                    .and_then(|project| project.recovery_items().ok())
+                    .is_some_and(|items| !items.is_empty());
                 self.session_started = Instant::now();
                 self.session_start_words = self.project_word_count();
             }
@@ -312,6 +405,44 @@ impl NovelQuillApp {
         }
     }
 
+    fn save_prompt_preset(&mut self) {
+        let name = self.prompt_preset_name.trim();
+        if name.is_empty() || self.ai_prompt.trim().is_empty() {
+            self.status = "Enter a preset name and custom instructions first".into();
+            return;
+        }
+        let Some(project) = &mut self.project else {
+            return;
+        };
+        project.manifest.prompt_presets.push(PromptPreset {
+            name: name.to_owned(),
+            instructions: self.ai_prompt.trim().to_owned(),
+        });
+        self.selected_prompt_preset = Some(project.manifest.prompt_presets.len() - 1);
+        match project.save_manifest() {
+            Ok(()) => self.status = format!("Saved prompt preset “{name}”"),
+            Err(error) => self.status = error.to_string(),
+        }
+    }
+
+    fn delete_prompt_preset(&mut self) {
+        let Some(index) = self.selected_prompt_preset else {
+            return;
+        };
+        let Some(project) = &mut self.project else {
+            return;
+        };
+        if index < project.manifest.prompt_presets.len() {
+            project.manifest.prompt_presets.remove(index);
+            self.selected_prompt_preset = None;
+            self.prompt_preset_name.clear();
+            match project.save_manifest() {
+                Ok(()) => self.status = "Deleted prompt preset".into(),
+                Err(error) => self.status = error.to_string(),
+            }
+        }
+    }
+
     fn request_ai(&mut self) {
         if self.ai_busy {
             return;
@@ -345,6 +476,7 @@ impl NovelQuillApp {
         manuscript_at_cursor.insert_str(cursor_byte, "<<<CURSOR>>>");
         self.ai_insert_target = Some((document.path.clone(), cursor_char));
         self.ai_replace_target = selection.map(|(start, end)| (document.path.clone(), start, end));
+        self.ai_target_snapshot = Some((document.path.clone(), document.content.clone()));
         let story_context = self.story_context(&document.path, &document.content);
         let task = match self.ai_action {
             AiAction::Continue => {
@@ -374,6 +506,10 @@ impl NovelQuillApp {
             ),
             AiAction::SceneBeats => format!(
                 "Extract the scene into an ordered list of concise dramatic beats. State the goal, conflict, turning point, and outcome.\n\nSCENE:\n{}",
+                document.content
+            ),
+            AiAction::Extract => format!(
+                "Extract structured story information from this scene. Return only valid JSON with this exact shape and no Markdown fence: {{\"synopsis\":\"2-4 factual sentences\",\"pov\":\"POV character or viewpoint\",\"location\":\"primary location\",\"story_time\":\"time information or empty\",\"tags\":[\"tag\"],\"characters\":[\"name\"],\"plot_threads\":[\"thread\"],\"beats\":\"ordered concise beats\",\"codex\":[{{\"name\":\"name\",\"category\":\"Character|Location|Object|Faction|Lore\",\"description\":\"facts established in this scene\"}}]}}. Include only facts supported by the scene.\n\nSCENE:\n{}",
                 document.content
             ),
             AiAction::Chat => {
@@ -421,13 +557,81 @@ impl NovelQuillApp {
         self.ai_output.clear();
         self.ai_busy = true;
         self.status = "Ollama is writing…".into();
-        self.ollama.send(OllamaRequest::Generate(GenerateRequest {
+        let request = GenerateRequest {
             base_url: self.settings.ollama_url.clone(),
             model: self.settings.model.clone(),
             system: SYSTEM_PROMPT.into(),
             prompt,
             temperature: self.settings.temperature,
-        }));
+            top_p: self.settings.top_p,
+            repeat_penalty: self.settings.repeat_penalty,
+            context_length: self.settings.context_length,
+            max_output_tokens: self.settings.max_output_tokens,
+        };
+        self.last_generation_request = Some(request.clone());
+        self.ollama.send(OllamaRequest::Generate(request));
+    }
+
+    fn regenerate_ai(&mut self) {
+        let Some(request) = self.last_generation_request.clone() else {
+            self.status = "Generate a suggestion before requesting an alternative".into();
+            return;
+        };
+        if self.ai_busy {
+            return;
+        }
+        self.ai_output.clear();
+        self.ai_busy = true;
+        self.status = "Ollama is generating an alternative…".into();
+        self.ollama.send(OllamaRequest::Generate(request));
+    }
+
+    fn generate_alternative_batch(&mut self, count: usize) {
+        if self.last_generation_request.is_none() {
+            self.status = "Generate a suggestion before requesting alternatives".into();
+            return;
+        }
+        if self.ai_busy || count == 0 {
+            return;
+        }
+        self.alternatives_remaining = count;
+        self.start_next_alternative();
+    }
+
+    fn start_next_alternative(&mut self) {
+        let Some(request) = self.last_generation_request.clone() else {
+            self.alternatives_remaining = 0;
+            return;
+        };
+        if self.alternatives_remaining == 0 {
+            return;
+        }
+        self.alternatives_remaining -= 1;
+        self.ai_output.clear();
+        self.ai_busy = true;
+        self.generation_was_chat = false;
+        self.status = format!(
+            "Ollama is generating alternatives… {} remaining after this one",
+            self.alternatives_remaining
+        );
+        self.ollama.send(OllamaRequest::Generate(request));
+    }
+
+    fn ai_target_is_unchanged(&mut self) -> bool {
+        let Some((path, snapshot)) = &self.ai_target_snapshot else {
+            return true;
+        };
+        let unchanged = self
+            .documents
+            .iter()
+            .find(|document| document.path == *path)
+            .is_some_and(|document| document.content == *snapshot);
+        if !unchanged {
+            self.status =
+                "The target document changed after generation. Generate again before applying AI text."
+                    .into();
+        }
+        unchanged
     }
 
     fn story_context(&self, path: &std::path::Path, content: &str) -> String {
@@ -438,32 +642,50 @@ impl NovelQuillApp {
         if !project.manifest.title.is_empty() {
             context.push_str(&format!("Title: {}\n", project.manifest.title));
         }
-        if !project.manifest.style_guide.is_empty() {
+        if self.settings.include_style_guide && !project.manifest.style_guide.is_empty() {
             context.push_str(&format!("Style guide: {}\n", project.manifest.style_guide));
         }
         if let Some(meta) = project.document_meta(path) {
-            context.push_str(&format!(
-                "Current {} — POV: {}; location: {}; story time: {}; status: {}\nSynopsis: {}\nScene beats: {}\nPlot threads: {}\n",
-                meta.kind.label(),
-                value_or_unknown(&meta.pov),
-                value_or_unknown(&meta.location),
-                value_or_unknown(&meta.story_time),
-                meta.status,
-                value_or_unknown(&meta.synopsis),
-                value_or_unknown(&meta.beats),
-                meta.plot_threads.join(", ")
-            ));
-            let mut earlier = project
-                .manifest
-                .documents
-                .iter()
-                .filter(|other| other.order < meta.order && !other.synopsis.is_empty())
-                .collect::<Vec<_>>();
-            earlier.sort_by_key(|other| other.order);
-            if !earlier.is_empty() {
-                context.push_str("Earlier scene summaries:\n");
-                for other in earlier.into_iter().rev().take(8).rev() {
-                    context.push_str(&format!("- {}: {}\n", other.path, other.synopsis));
+            if self.settings.include_scene_metadata {
+                context.push_str(&format!(
+                    "Current {} — POV: {}; location: {}; story time: {}; status: {}\nSynopsis: {}\nScene beats: {}\nPlot threads: {}\n",
+                    meta.kind.label(),
+                    value_or_unknown(&meta.pov),
+                    value_or_unknown(&meta.location),
+                    value_or_unknown(&meta.story_time),
+                    meta.status,
+                    value_or_unknown(&meta.synopsis),
+                    value_or_unknown(&meta.beats),
+                    meta.plot_threads.join(", ")
+                ));
+            }
+            if self.settings.include_previous_summaries {
+                let mut earlier = project
+                    .manifest
+                    .documents
+                    .iter()
+                    .filter(|other| other.order < meta.order && !other.synopsis.is_empty())
+                    .collect::<Vec<_>>();
+                earlier.sort_by_key(|other| other.order);
+                if !earlier.is_empty() {
+                    context.push_str("Earlier scene summaries:\n");
+                    for other in earlier
+                        .into_iter()
+                        .rev()
+                        .take(self.settings.previous_summary_limit)
+                        .rev()
+                    {
+                        context.push_str(&format!("- {}: {}\n", other.path, other.synopsis));
+                    }
+                }
+            }
+        }
+        if self.settings.include_relevant_scenes {
+            let passages = self.relevant_scene_passages(path, content);
+            if !passages.is_empty() {
+                context.push_str("Relevant manuscript passages:\n");
+                for (label, excerpt, score) in passages {
+                    context.push_str(&format!("- {label} (relevance {score}):\n{excerpt}\n"));
                 }
             }
         }
@@ -477,7 +699,11 @@ impl NovelQuillApp {
                         .any(|alias| lowercase.contains(&alias.to_lowercase())))
         });
         let mut wrote_codex = false;
-        for entry in relevant.take(20) {
+        for entry in relevant.take(if self.settings.include_codex {
+            self.settings.codex_limit
+        } else {
+            0
+        }) {
             if !wrote_codex {
                 context.push_str("Relevant Codex entries:\n");
                 wrote_codex = true;
@@ -494,7 +720,59 @@ impl NovelQuillApp {
         context
     }
 
+    fn relevant_scene_passages(
+        &self,
+        current_path: &std::path::Path,
+        current_content: &str,
+    ) -> Vec<(String, String, usize)> {
+        let Some(project) = &self.project else {
+            return vec![];
+        };
+        let query_terms = meaningful_terms(current_content);
+        if query_terms.is_empty() {
+            return vec![];
+        }
+        let mut passages = project
+            .files
+            .iter()
+            .filter(|entry| !entry.is_dir && entry.path != current_path)
+            .filter(|entry| {
+                project
+                    .document_meta(&entry.path)
+                    .is_none_or(|meta| meta.ai_include && !meta.archived)
+            })
+            .filter_map(|entry| {
+                let text = self
+                    .documents
+                    .iter()
+                    .find(|document| document.path == entry.path)
+                    .map(|document| document.content.clone())
+                    .or_else(|| fs::read_to_string(&entry.path).ok())?;
+                let (score, excerpt) = best_relevant_excerpt(
+                    &text,
+                    &query_terms,
+                    self.settings.relevant_scene_excerpt_chars,
+                );
+                (score > 0).then(|| {
+                    let label = entry
+                        .path
+                        .strip_prefix(&project.root)
+                        .unwrap_or(&entry.path)
+                        .display()
+                        .to_string();
+                    (label, excerpt, score)
+                })
+            })
+            .collect::<Vec<_>>();
+        passages.sort_by(|left, right| right.2.cmp(&left.2).then_with(|| left.0.cmp(&right.0)));
+        passages.truncate(self.settings.relevant_scene_limit);
+        passages
+    }
+
     fn insert_ai_at_cursor(&mut self) {
+        if !self.ai_target_is_unchanged() {
+            return;
+        }
         let Some((path, cursor_char)) = self.ai_insert_target.clone() else {
             self.status = "Generate a suggestion for the current cursor first".into();
             return;
@@ -543,6 +821,9 @@ impl NovelQuillApp {
     }
 
     fn replace_ai_target(&mut self) {
+        if !self.ai_target_is_unchanged() {
+            return;
+        }
         if let Some((path, start_char, end_char)) = self.ai_replace_target.clone()
             && let Some(index) = self
                 .documents
@@ -563,7 +844,11 @@ impl NovelQuillApp {
             self.status = "Selection replaced; use History or Undo if needed".into();
             return;
         }
-        if let Some(index) = self.active {
+        if let Some(index) = self.ai_insert_target.as_ref().and_then(|(path, _)| {
+            self.documents
+                .iter()
+                .position(|document| document.path == *path)
+        }) {
             let path = self.documents[index].path.clone();
             self.ai_undo_stack
                 .push((path, self.documents[index].content.clone()));
@@ -593,6 +878,78 @@ impl NovelQuillApp {
         }
     }
 
+    fn apply_scene_extraction(&mut self) {
+        if !self.ai_target_is_unchanged() {
+            return;
+        }
+        let Some((path, _)) = self.ai_insert_target.clone() else {
+            self.status = "Generate scene extraction for an open document first".into();
+            return;
+        };
+        let text = self.ai_output.trim();
+        let json = text
+            .find('{')
+            .zip(text.rfind('}'))
+            .and_then(|(start, end)| (start <= end).then_some(&text[start..=end]));
+        let Some(json) = json else {
+            self.status = "The extraction did not contain valid JSON; regenerate it".into();
+            return;
+        };
+        let extraction = match serde_json::from_str::<SceneExtraction>(json) {
+            Ok(extraction) => extraction,
+            Err(error) => {
+                self.status = format!("Could not read extraction: {error}");
+                return;
+            }
+        };
+        let Some(project) = &mut self.project else {
+            return;
+        };
+        if let Some(meta) = project.document_meta_mut(&path) {
+            meta.synopsis = extraction.synopsis;
+            meta.pov = extraction.pov;
+            meta.location = extraction.location;
+            meta.story_time = extraction.story_time;
+            meta.tags = extraction.tags;
+            meta.characters = extraction.characters;
+            meta.plot_threads = extraction.plot_threads;
+            meta.beats = extraction.beats;
+        }
+        let mut added = 0;
+        for item in extraction.codex {
+            if item.name.trim().is_empty()
+                || project
+                    .manifest
+                    .codex
+                    .iter()
+                    .any(|entry| entry.name.eq_ignore_ascii_case(item.name.trim()))
+            {
+                continue;
+            }
+            let entry = CodexEntry {
+                name: item.name.trim().to_owned(),
+                category: if item.category.trim().is_empty() {
+                    "Lore".into()
+                } else {
+                    item.category.trim().to_owned()
+                },
+                description: item.description.trim().to_owned(),
+                ..CodexEntry::default()
+            };
+            project.manifest.codex.push(entry);
+            added += 1;
+        }
+        match project.save_manifest() {
+            Ok(()) => {
+                self.status = format!(
+                    "Applied scene metadata and added {added} new Codex entr{}",
+                    if added == 1 { "y" } else { "ies" }
+                )
+            }
+            Err(error) => self.status = error.to_string(),
+        }
+    }
+
     fn compose_ai_document_version(&mut self) {
         let mut version = self.ai_comparison_original.clone();
         if self.ai_generation_action == AiAction::Continue {
@@ -613,6 +970,9 @@ impl NovelQuillApp {
     }
 
     fn accept_ai_document_version(&mut self) {
+        if !self.ai_target_is_unchanged() {
+            return;
+        }
         let path = self
             .ai_replace_target
             .as_ref()
@@ -666,7 +1026,6 @@ impl NovelQuillApp {
                 }
                 OllamaResponse::Finished => {
                     self.ai_busy = false;
-                    self.status = "Suggestion ready".into();
                     if !self.ai_output.trim().is_empty() {
                         self.generation_history.push(self.ai_output.clone());
                         if self.generation_history.len() > 20 {
@@ -683,13 +1042,20 @@ impl NovelQuillApp {
                         }
                     }
                     self.generation_was_chat = false;
+                    if self.alternatives_remaining > 0 {
+                        self.start_next_alternative();
+                    } else {
+                        self.status = "Suggestion ready".into();
+                    }
                 }
                 OllamaResponse::Cancelled => {
                     self.ai_busy = false;
+                    self.alternatives_remaining = 0;
                     self.status = "Generation stopped".into();
                 }
                 OllamaResponse::Error(error) => {
                     self.ai_busy = false;
+                    self.alternatives_remaining = 0;
                     self.status = error;
                 }
             }
@@ -697,6 +1063,32 @@ impl NovelQuillApp {
         }
         if self.ai_busy {
             ctx.request_repaint_after(Duration::from_millis(100));
+        }
+    }
+
+    fn poll_updates(&mut self, ctx: &egui::Context) {
+        while let Some(update) = self.updates.try_recv() {
+            match update {
+                UpdateStatus::UpToDate => {
+                    if self.manual_update_check {
+                        self.status = "Novel Quill Studio is up to date".into();
+                    }
+                }
+                UpdateStatus::Available { version, url } => {
+                    self.status = format!("Novel Quill Studio {version} is available");
+                    self.update_available = Some((version, url));
+                }
+                UpdateStatus::Error(error) => {
+                    if self.manual_update_check {
+                        self.status = format!("Could not check for updates: {error}");
+                    }
+                }
+            }
+            self.manual_update_check = false;
+            ctx.request_repaint();
+        }
+        if self.updates.is_busy() {
+            ctx.request_repaint_after(Duration::from_millis(250));
         }
     }
 
@@ -823,8 +1215,22 @@ impl NovelQuillApp {
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        if ctx.input_mut(|input| {
+            input.consume_key(
+                egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                egui::Key::S,
+            )
+        }) {
+            self.save_all();
+            self.status = "Saved all open documents".into();
+        }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S)) {
             self.save_active();
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F))
+            && self.active.is_some()
+        {
+            self.show_find_replace = true;
         }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::O))
             && let Some(path) = rfd::FileDialog::new().pick_folder()
@@ -842,6 +1248,28 @@ impl NovelQuillApp {
             } else {
                 CenterView::Preview
             };
+        }
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F11)) {
+            self.focus_mode = !self.focus_mode;
+        }
+        let ai_ready = self.active.is_some()
+            && !self.ai_busy
+            && !self.settings.model.is_empty()
+            && (!matches!(self.ai_action, AiAction::Custom | AiAction::Chat)
+                || !self.ai_prompt.trim().is_empty());
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter))
+            && ai_ready
+        {
+            self.request_ai();
+        }
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            if self.ai_busy {
+                self.ollama.cancel();
+                self.status = "Stopping generation…".into();
+            } else if self.pinned_document.take().is_some() {
+                self.center_view = CenterView::Editor;
+                self.status = "Closed side-by-side document comparison".into();
+            }
         }
     }
 
@@ -946,6 +1374,19 @@ impl NovelQuillApp {
                         self.show_revisions = true;
                         ui.close_menu();
                     }
+                    if ui
+                        .add_enabled(
+                            self.project
+                                .as_ref()
+                                .and_then(|project| project.recovery_items().ok())
+                                .is_some_and(|items| !items.is_empty()),
+                            egui::Button::new("Recover unsaved work…"),
+                        )
+                        .clicked()
+                    {
+                        self.show_recovery = true;
+                        ui.close_menu();
+                    }
                 });
                 ui.menu_button("Edit", |ui| {
                     if ui
@@ -962,10 +1403,47 @@ impl NovelQuillApp {
                 if ui.button("Settings").clicked() {
                     self.show_settings = true;
                 }
+                ui.menu_button("Help", |ui| {
+                    if ui
+                        .add_enabled(
+                            !self.updates.is_busy(),
+                            egui::Button::new("Check for updates"),
+                        )
+                        .clicked()
+                    {
+                        self.manual_update_check = true;
+                        self.updates.check();
+                        self.status = "Checking for updates…".into();
+                        ui.close_menu();
+                    }
+                    if let Some((version, url)) = &self.update_available
+                        && ui.button(format!("Download {version}")).clicked()
+                    {
+                        ui.ctx().open_url(egui::OpenUrl::new_tab(url.clone()));
+                        ui.close_menu();
+                    }
+                    if ui.button("GitHub repository").clicked() {
+                        ui.ctx().open_url(egui::OpenUrl::new_tab(
+                            "https://github.com/kennethyork/novelquill",
+                        ));
+                        ui.close_menu();
+                    }
+                });
                 ui.separator();
                 ui.selectable_value(&mut self.center_view, CenterView::Editor, "Write");
                 ui.selectable_value(&mut self.center_view, CenterView::Preview, "Preview");
                 ui.selectable_value(&mut self.center_view, CenterView::Split, "Split");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if self.focus_mode {
+                        ui.label(
+                            RichText::new("FOCUS MODE · F11 to exit")
+                                .small()
+                                .color(Color32::from_rgb(205, 174, 102)),
+                        );
+                    } else if let Some(project) = &self.project {
+                        ui.label(RichText::new(project.name()).strong());
+                    }
+                });
             });
         });
     }
@@ -1032,22 +1510,36 @@ impl NovelQuillApp {
             {
                 self.show_new_document = true;
             }
-            if ui.small_button("▣").on_hover_text("New folder").clicked() {
-                self.show_new_folder = true;
-            }
-            if ui
-                .small_button("Trash")
-                .on_hover_text("Restore deleted documents")
-                .clicked()
-            {
-                self.show_trash = true;
-            }
-            if ui.small_button("↻").on_hover_text("Refresh").clicked()
-                && let Some(project) = &mut self.project
-                && let Err(error) = project.refresh()
-            {
-                self.status = error.to_string();
-            }
+            ui.menu_button("•••", |ui| {
+                if ui.button("New folder…").clicked() {
+                    self.show_new_folder = true;
+                    ui.close_menu();
+                }
+                if ui.button("Project Trash…").clicked() {
+                    self.show_trash = true;
+                    ui.close_menu();
+                }
+                let has_recovery = self
+                    .project
+                    .as_ref()
+                    .and_then(|project| project.recovery_items().ok())
+                    .is_some_and(|items| !items.is_empty());
+                if ui
+                    .add_enabled(has_recovery, egui::Button::new("Recover unsaved writing…"))
+                    .clicked()
+                {
+                    self.show_recovery = true;
+                    ui.close_menu();
+                }
+                if ui.button("Refresh files").clicked() {
+                    if let Some(project) = &mut self.project
+                        && let Err(error) = project.refresh()
+                    {
+                        self.status = error.to_string();
+                    }
+                    ui.close_menu();
+                }
+            });
         });
         ui.add(
             egui::TextEdit::singleline(&mut self.search)
@@ -1079,6 +1571,7 @@ impl NovelQuillApp {
         let mut duplicate_path = None;
         let mut pin_path = None;
         let mut trash_active = false;
+        let mut reorder_action = None;
         egui::ScrollArea::vertical().show(ui, |ui| {
             for entry in entries {
                 let name = entry
@@ -1120,48 +1613,78 @@ impl NovelQuillApp {
                     } else {
                         format!("○ {name}")
                     };
-                    if ui.selectable_label(active, label).clicked() {
+                    let document_response = ui.add(
+                        egui::Button::new(label)
+                            .selected(active)
+                            .frame(false)
+                            .sense(egui::Sense::click_and_drag()),
+                    );
+                    if document_response.clicked() {
                         open_path = Some(entry.path.clone());
                     }
-                    if ui
-                        .small_button("⇄")
-                        .on_hover_text(if self.pinned_document.as_ref() == Some(&entry.path) {
-                            "Close this side-by-side comparison"
-                        } else {
-                            "Open this copy side by side"
-                        })
-                        .clicked()
+                    document_response.dnd_set_drag_payload(entry.path.clone());
+                    if let Some(source) = document_response.dnd_release_payload::<PathBuf>()
+                        && source.as_path() != entry.path
                     {
-                        pin_path = Some(entry.path.clone());
+                        reorder_action = Some((source.as_ref().clone(), entry.path.clone()));
                     }
-                    if active {
-                        if ui
-                            .small_button("⧉")
-                            .on_hover_text("Duplicate document")
-                            .clicked()
+                    ui.menu_button("⋯", |ui| {
+                        let comparison_label = if self.pinned_document.as_ref() == Some(&entry.path)
                         {
+                            "Close side-by-side comparison"
+                        } else {
+                            "Compare side by side"
+                        };
+                        if ui.button(comparison_label).clicked() {
+                            pin_path = Some(entry.path.clone());
+                            ui.close_menu();
+                        }
+                        if ui.button("Duplicate document").clicked() {
                             duplicate_path = Some(entry.path.clone());
+                            ui.close_menu();
                         }
-                        if ui.small_button("↑").on_hover_text("Move earlier").clicked() {
+                        ui.separator();
+                        if ui.button("Move earlier").clicked() {
                             move_action = Some((entry.path.clone(), -1));
+                            ui.close_menu();
                         }
-                        if ui.small_button("↓").on_hover_text("Move later").clicked() {
+                        if ui.button("Move later").clicked() {
                             move_action = Some((entry.path.clone(), 1));
+                            ui.close_menu();
                         }
+                        ui.separator();
                         if ui
-                            .small_button("×")
-                            .on_hover_text("Move this document to recoverable Trash")
+                            .button(
+                                RichText::new("Move to Project Trash…")
+                                    .color(Color32::from_rgb(231, 137, 126)),
+                            )
                             .clicked()
                         {
-                            trash_active = true;
+                            if active {
+                                trash_active = true;
+                            } else {
+                                self.pending_trash = Some(entry.path.clone());
+                            }
+                            ui.close_menu();
                         }
-                    }
+                    });
                 });
             }
         });
         if trash_active {
-            self.trash_active_document();
+            self.pending_trash = self
+                .active
+                .and_then(|index| self.documents.get(index))
+                .map(|document| document.path.clone());
             return None;
+        }
+        if let Some((source, target)) = reorder_action
+            && let Some(project) = &mut self.project
+        {
+            match project.reorder_document_before(&source, &target) {
+                Ok(()) => self.status = "Reordered document by drag and drop".into(),
+                Err(error) => self.status = error.to_string(),
+            }
         }
         if let Some((path, direction)) = move_action
             && let Some(project) = &mut self.project
@@ -1679,10 +2202,14 @@ impl NovelQuillApp {
                         if response.middle_clicked() {
                             close = Some(index);
                         }
-                        if self.active == Some(index) && ui.small_button("×").clicked() {
+                        if self.active == Some(index)
+                            && ui
+                                .small_button("×")
+                                .on_hover_text("Close document")
+                                .clicked()
+                        {
                             close = Some(index);
                         }
-                        ui.separator();
                     }
                 });
             });
@@ -1714,6 +2241,25 @@ impl NovelQuillApp {
             let mut split = false;
             let mut trash = false;
             ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(self.documents[index].title())
+                        .strong()
+                        .size(17.0),
+                );
+                if self.documents[index].is_dirty() {
+                    ui.label(
+                        RichText::new("UNSAVED")
+                            .small()
+                            .color(Color32::from_rgb(224, 181, 91)),
+                    );
+                } else {
+                    ui.label(
+                        RichText::new("SAVED")
+                            .small()
+                            .color(Color32::from_rgb(120, 177, 143)),
+                    );
+                }
+                ui.separator();
                 if ui
                     .small_button("H1")
                     .on_hover_text("Chapter heading")
@@ -1739,34 +2285,48 @@ impl NovelQuillApp {
                     insert = Some("<!-- TODO:  -->");
                 }
                 ui.separator();
-                if ui.button("Scene details").clicked() {
-                    self.show_document_meta = true;
-                }
-                if ui.button("Rename").clicked() {
-                    self.rename_name = self.documents[index]
-                        .path
-                        .file_name()
-                        .and_then(|value| value.to_str())
-                        .unwrap_or("Untitled.md")
-                        .to_owned();
-                    self.show_rename = true;
-                }
                 if ui
-                    .button("Split scenes")
-                    .on_hover_text("Split at level-two headings")
+                    .button("Find")
+                    .on_hover_text("Find and replace · Ctrl+F")
                     .clicked()
                 {
-                    split = true;
-                }
-                if ui.button("Trash").clicked() {
-                    trash = true;
-                }
-                if ui.button("Find/replace").clicked() {
                     self.show_find_replace = true;
                 }
-                if ui.button("History").clicked() {
-                    self.show_revisions = true;
-                }
+                ui.menu_button("Document", |ui| {
+                    if ui.button("Scene details…").clicked() {
+                        self.show_document_meta = true;
+                        ui.close_menu();
+                    }
+                    if ui.button("Rename…").clicked() {
+                        self.rename_name = self.documents[index]
+                            .path
+                            .file_name()
+                            .and_then(|value| value.to_str())
+                            .unwrap_or("Untitled.md")
+                            .to_owned();
+                        self.show_rename = true;
+                        ui.close_menu();
+                    }
+                    if ui.button("Revision history…").clicked() {
+                        self.show_revisions = true;
+                        ui.close_menu();
+                    }
+                    if ui.button("Split at scene headings…").clicked() {
+                        split = true;
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui
+                        .button(
+                            RichText::new("Move to Project Trash…")
+                                .color(Color32::from_rgb(231, 137, 126)),
+                        )
+                        .clicked()
+                    {
+                        trash = true;
+                        ui.close_menu();
+                    }
+                });
                 if self.center_view == CenterView::Split && self.pinned_document.is_some() {
                     ui.separator();
                     if ui.button("Close comparison ×").clicked() {
@@ -1787,7 +2347,7 @@ impl NovelQuillApp {
                 return;
             }
             if trash {
-                self.trash_active_document();
+                self.pending_trash = Some(self.documents[index].path.clone());
                 return;
             }
         }
@@ -1871,6 +2431,64 @@ impl NovelQuillApp {
         }
     }
 
+    fn trash_document(&mut self, path: &PathBuf) {
+        if let Some(index) = self
+            .documents
+            .iter()
+            .position(|document| &document.path == path)
+        {
+            self.active = Some(index);
+            self.trash_active_document();
+            return;
+        }
+        if let Some(project) = &mut self.project {
+            match project.trash_document(path) {
+                Ok(()) => self.status = "Moved document to recoverable Project Trash".into(),
+                Err(error) => self.status = error.to_string(),
+            }
+        }
+    }
+
+    fn restore_recovery_item(&mut self, item: &RecoveryItem) {
+        let Some(project) = &self.project else {
+            return;
+        };
+        match project.restore_recovery(item) {
+            Ok(path) => {
+                if let Some(index) = self
+                    .documents
+                    .iter()
+                    .position(|document| document.path == path)
+                {
+                    match Document::open(path) {
+                        Ok(document) => {
+                            self.documents[index] = document;
+                            self.active = Some(index);
+                        }
+                        Err(error) => {
+                            self.status = error.to_string();
+                            return;
+                        }
+                    }
+                } else {
+                    self.open_document(path);
+                }
+                self.status = "Recovered unsaved writing from the previous session".into();
+            }
+            Err(error) => self.status = error.to_string(),
+        }
+    }
+
+    fn discard_recovery_item(&mut self, item: &RecoveryItem) {
+        let Some(project) = &self.project else {
+            return;
+        };
+        match project.discard_recovery(item) {
+            Ok(()) => self.status = "Discarded recovery snapshot".into(),
+            Err(error) => self.status = error.to_string(),
+        }
+    }
+
     fn split_active_document(&mut self) {
         let Some(index) = self.active else { return };
         self.save_active();
@@ -1904,7 +2522,7 @@ impl NovelQuillApp {
         egui::ScrollArea::vertical()
             .id_salt(scroll_id)
             .show(ui, |ui| {
-                let width = (ui.available_width() - 32.0).clamp(300.0, 850.0);
+                let width = (ui.available_width() - 48.0).clamp(300.0, 820.0);
                 ui.horizontal(|ui| {
                     let margin = ((ui.available_width() - width) / 2.0).max(0.0);
                     ui.add_space(margin);
@@ -1913,14 +2531,22 @@ impl NovelQuillApp {
                         job.wrap.max_width = wrap_width;
                         ui.fonts(|fonts| fonts.layout_job(job))
                     };
-                    let edit = egui::TextEdit::multiline(&mut self.documents[index].content)
-                        .font(FontId::new(font_size, egui::FontFamily::Proportional))
-                        .desired_width(width)
-                        .desired_rows(35)
-                        .lock_focus(true)
-                        .margin(egui::Margin::symmetric(18, 20))
-                        .layouter(&mut layouter);
-                    let output = edit.show(ui);
+                    let output = egui::Frame::new()
+                        .fill(Color32::from_rgb(31, 32, 35))
+                        .stroke(egui::Stroke::new(1.0, Color32::from_rgb(50, 52, 57)))
+                        .corner_radius(egui::CornerRadius::same(6))
+                        .inner_margin(egui::Margin::symmetric(26, 28))
+                        .show(ui, |ui| {
+                            egui::TextEdit::multiline(&mut self.documents[index].content)
+                                .font(FontId::new(font_size, egui::FontFamily::Proportional))
+                                .desired_width(width - 52.0)
+                                .desired_rows(35)
+                                .lock_focus(true)
+                                .frame(false)
+                                .layouter(&mut layouter)
+                                .show(ui)
+                        })
+                        .inner;
                     if output.response.changed() {
                         self.last_edit = Instant::now();
                     }
@@ -1939,8 +2565,25 @@ impl NovelQuillApp {
         if !self.ai_panel || self.focus_mode {
             return;
         }
-        egui::SidePanel::right("assistant").default_width(330.0).min_width(260.0).show(ctx, |ui| {
-            ui.heading("Ollama Assistant");
+        let prompt_presets = self
+            .project
+            .as_ref()
+            .map(|project| project.manifest.prompt_presets.clone())
+            .unwrap_or_default();
+        egui::SidePanel::right("assistant").default_width(350.0).min_width(280.0).show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.heading("Ollama Assistant");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("×").on_hover_text("Close assistant").clicked() {
+                        self.ai_panel = false;
+                    }
+                });
+            });
+            ui.label(
+                RichText::new("Local writing help · active document only")
+                    .small()
+                    .color(Color32::from_rgb(145, 150, 160)),
+            );
             ui.horizontal(|ui| {
                 egui::ComboBox::from_id_salt("model").selected_text(if self.settings.model.is_empty() { "No model" } else { &self.settings.model }).show_ui(ui, |ui| {
                     for model in &self.models { ui.selectable_value(&mut self.settings.model, model.clone(), model); }
@@ -1951,15 +2594,24 @@ impl NovelQuillApp {
                 }
             });
             ui.separator();
-            ui.horizontal_wrapped(|ui| {
-                ui.selectable_value(&mut self.ai_action, AiAction::Continue, "Continue");
-                ui.selectable_value(&mut self.ai_action, AiAction::Rewrite, "Rewrite");
-                ui.selectable_value(&mut self.ai_action, AiAction::Brainstorm, "Ideas");
-                ui.selectable_value(&mut self.ai_action, AiAction::Summarize, "Summary");
-                ui.selectable_value(&mut self.ai_action, AiAction::Critique, "Critique");
-                ui.selectable_value(&mut self.ai_action, AiAction::SceneBeats, "Beats");
-                ui.selectable_value(&mut self.ai_action, AiAction::Chat, "Chat");
-                ui.selectable_value(&mut self.ai_action, AiAction::Custom, "Ask");
+            ui.label(RichText::new("ACTION").small().strong());
+            egui::ComboBox::from_id_salt("ai-action")
+                .selected_text(self.ai_action.label())
+                .width(ui.available_width())
+                .show_ui(ui, |ui| {
+                    for action in [
+                        AiAction::Continue,
+                        AiAction::Rewrite,
+                        AiAction::Brainstorm,
+                        AiAction::Summarize,
+                        AiAction::Critique,
+                        AiAction::SceneBeats,
+                        AiAction::Extract,
+                        AiAction::Chat,
+                        AiAction::Custom,
+                    ] {
+                        ui.selectable_value(&mut self.ai_action, action, action.label());
+                    }
             });
             if self.ai_action == AiAction::Continue {
                 ui.horizontal(|ui| {
@@ -2000,41 +2652,182 @@ impl NovelQuillApp {
                         .desired_rows(3),
                 );
             } else if self.ai_action == AiAction::Custom {
+                egui::ComboBox::from_id_salt("prompt-presets")
+                    .selected_text(
+                        self.selected_prompt_preset
+                            .and_then(|index| prompt_presets.get(index))
+                            .map(|preset| preset.name.as_str())
+                            .unwrap_or("Reusable prompt presets"),
+                    )
+                    .show_ui(ui, |ui| {
+                        for (index, preset) in prompt_presets.iter().enumerate() {
+                            if ui
+                                .selectable_label(
+                                    self.selected_prompt_preset == Some(index),
+                                    &preset.name,
+                                )
+                                .clicked()
+                            {
+                                self.selected_prompt_preset = Some(index);
+                                self.prompt_preset_name.clone_from(&preset.name);
+                                self.ai_prompt.clone_from(&preset.instructions);
+                            }
+                        }
+                    });
                 ui.add(egui::TextEdit::multiline(&mut self.ai_prompt).hint_text("Describe the change, scene, tone, or problem…").desired_rows(4));
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.prompt_preset_name)
+                            .hint_text("Preset name"),
+                    );
+                    if ui.button("Save preset").clicked() {
+                        self.save_prompt_preset();
+                    }
+                    if ui
+                        .add_enabled(
+                            self.selected_prompt_preset.is_some(),
+                            egui::Button::new("Delete"),
+                        )
+                        .clicked()
+                    {
+                        self.delete_prompt_preset();
+                    }
+                });
+            }
+            let mut context_changed = false;
+            ui.collapsing("Context controls", |ui| {
+                context_changed |= ui
+                    .checkbox(&mut self.settings.include_style_guide, "Style guide")
+                    .changed();
+                context_changed |= ui
+                    .checkbox(&mut self.settings.include_scene_metadata, "Scene metadata")
+                    .changed();
+                context_changed |= ui
+                    .checkbox(
+                        &mut self.settings.include_previous_summaries,
+                        "Earlier scene summaries",
+                    )
+                    .changed();
+                context_changed |= ui
+                    .checkbox(
+                        &mut self.settings.include_relevant_scenes,
+                        "Relevant manuscript passages",
+                    )
+                    .changed();
+                context_changed |= ui
+                    .checkbox(&mut self.settings.include_codex, "Relevant Codex entries")
+                    .changed();
+                context_changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut self.settings.previous_summary_limit)
+                            .range(0..=50)
+                            .prefix("Summary limit: "),
+                    )
+                    .changed();
+                context_changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut self.settings.codex_limit)
+                            .range(0..=100)
+                            .prefix("Codex limit: "),
+                    )
+                    .changed();
+                context_changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut self.settings.relevant_scene_limit)
+                            .range(0..=10)
+                            .prefix("Relevant passages: "),
+                    )
+                    .changed();
+                if !self.prompt_preview.is_empty() {
+                    let estimated_tokens = self.prompt_preview.chars().count().div_ceil(4);
+                    ui.small(format!(
+                        "Last assembled prompt: {} characters · approximately {estimated_tokens} tokens",
+                        self.prompt_preview.chars().count()
+                    ));
+                }
+            });
+            if context_changed {
+                let _ = self.settings.save();
             }
             let ready = self.active.is_some() && !self.ai_busy && !self.settings.model.is_empty()
                 && (!matches!(self.ai_action, AiAction::Custom | AiAction::Chat)
                     || !self.ai_prompt.trim().is_empty());
             ui.horizontal(|ui| {
-                if ui.add_enabled(ready, egui::Button::new(if self.ai_busy { "Writing…" } else { "Generate" }).min_size([100.0, 30.0].into())).clicked() { self.request_ai(); }
+                let generate = egui::Button::new(
+                    RichText::new(if self.ai_busy { "Writing…" } else { "Generate" }).strong(),
+                )
+                .fill(Color32::from_rgb(102, 82, 45))
+                .min_size([112.0, 32.0].into());
+                if ui.add_enabled(ready, generate).clicked() { self.request_ai(); }
                 if ui.add_enabled(self.ai_busy, egui::Button::new("Stop")).clicked() {
                     self.ollama.cancel();
                     self.status = "Stopping generation…".into();
                 }
-                if ui.button("Prompt preview").clicked() { self.show_prompt_preview = true; }
+                if ui
+                    .add_enabled(
+                        !self.ai_busy && self.last_generation_request.is_some(),
+                        egui::Button::new("Alternative"),
+                    )
+                    .on_hover_text("Regenerate from the exact same prompt and context")
+                    .clicked()
+                {
+                    self.regenerate_ai();
+                }
+                if ui
+                    .add_enabled(
+                        !self.ai_busy
+                            && self.last_generation_request.is_some()
+                            && self.ai_generation_action != AiAction::Chat,
+                        egui::Button::new("3 options"),
+                    )
+                    .on_hover_text("Generate three alternatives from the exact same context")
+                    .clicked()
+                {
+                    self.generate_alternative_batch(3);
+                }
             });
+            if ui
+                .small_button("Inspect exact prompt and context")
+                .on_hover_text("Review everything that will be sent to Ollama")
+                .clicked()
+            {
+                self.show_prompt_preview = true;
+            }
             if self.ai_busy { ui.add(egui::Spinner::new()); }
             ui.separator();
             ui.label(RichText::new("Suggestion").strong());
             ui.add(egui::TextEdit::multiline(&mut self.ai_output).hint_text("Generated text will appear here. You can edit it before inserting.").desired_rows(18));
             ui.horizontal_wrapped(|ui| {
                 let has_output = !self.ai_output.trim().is_empty() && self.active.is_some();
-                if ui
-                    .add_enabled(has_output, egui::Button::new("Insert at cursor"))
-                    .clicked()
-                {
-                    self.insert_ai_at_cursor();
+                let manuscript_output = matches!(
+                    self.ai_generation_action,
+                    AiAction::Continue | AiAction::Rewrite | AiAction::Custom
+                );
+                if manuscript_output {
+                    if ui
+                        .add_enabled(has_output, egui::Button::new("Insert at cursor"))
+                        .clicked()
+                    {
+                        self.insert_ai_at_cursor();
+                    }
+                    let replace_label = if self.ai_replace_target.is_some() { "Replace selection" } else { "Replace document" };
+                    if ui.add_enabled(has_output, egui::Button::new(replace_label)).clicked() {
+                        self.replace_ai_target();
+                    }
+                    if ui
+                        .add_enabled(has_output, egui::Button::new("Compare side by side"))
+                        .clicked()
+                    {
+                        self.compose_ai_document_version();
+                        self.show_ai_compare = true;
+                    }
                 }
-                let replace_label = if self.ai_replace_target.is_some() { "Replace selection" } else { "Replace document" };
-                if ui.add_enabled(has_output, egui::Button::new(replace_label)).clicked() {
-                    self.replace_ai_target();
-                }
-                if ui
-                    .add_enabled(has_output, egui::Button::new("Compare side by side"))
-                    .clicked()
+                if self.ai_generation_action == AiAction::Extract
+                    && ui
+                        .add_enabled(has_output, egui::Button::new("Apply to scene & Codex"))
+                        .clicked()
                 {
-                    self.compose_ai_document_version();
-                    self.show_ai_compare = true;
+                    self.apply_scene_extraction();
                 }
                 if ui
                     .add_enabled(!self.ai_undo_stack.is_empty(), egui::Button::new("Undo AI edit"))
@@ -2071,6 +2864,17 @@ impl NovelQuillApp {
         let session_minutes = self.session_started.elapsed().as_secs() / 60;
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             ui.horizontal(|ui| {
+                let status_color = if self.status.to_lowercase().contains("error")
+                    || self.status.to_lowercase().contains("could not")
+                    || self.status.to_lowercase().contains("failed")
+                {
+                    Color32::from_rgb(231, 137, 126)
+                } else if self.ai_busy {
+                    Color32::from_rgb(224, 181, 91)
+                } else {
+                    Color32::from_rgb(151, 187, 164)
+                };
+                ui.label(RichText::new("●").color(status_color));
                 ui.label(&self.status);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(format!(
@@ -2087,6 +2891,37 @@ impl NovelQuillApp {
     }
 
     fn dialogs(&mut self, ctx: &egui::Context) {
+        if let Some(path) = self.pending_trash.clone() {
+            let name = path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("this document")
+                .to_owned();
+            egui::Window::new("Move document to Project Trash?")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.label(format!("“{name}” will leave the manuscript."));
+                    ui.label("You can restore it later from Project Trash.");
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button(
+                                RichText::new("Move to Trash")
+                                    .color(Color32::from_rgb(231, 137, 126)),
+                            )
+                            .clicked()
+                        {
+                            self.trash_document(&path);
+                            self.pending_trash = None;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.pending_trash = None;
+                        }
+                    });
+                });
+        }
         if self.show_new_document {
             egui::Window::new("New document")
                 .collapsible(false)
@@ -2147,6 +2982,26 @@ impl NovelQuillApp {
                             .text("Creativity"),
                     );
                     ui.add(
+                        egui::Slider::new(&mut self.settings.top_p, 0.05..=1.0)
+                            .text("Top-p diversity"),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut self.settings.repeat_penalty, 0.8..=2.0)
+                            .text("Repeat penalty"),
+                    );
+                    ui.add(
+                        egui::DragValue::new(&mut self.settings.context_length)
+                            .range(2_048..=262_144)
+                            .prefix("Context: ")
+                            .suffix(" tokens"),
+                    );
+                    ui.add(
+                        egui::DragValue::new(&mut self.settings.max_output_tokens)
+                            .range(64..=32_768)
+                            .prefix("Maximum output: ")
+                            .suffix(" tokens"),
+                    );
+                    ui.add(
                         egui::Slider::new(&mut self.settings.font_size, 13.0..=28.0)
                             .text("Editor font"),
                     );
@@ -2157,6 +3012,10 @@ impl NovelQuillApp {
                             .suffix(" words"),
                     );
                     ui.checkbox(&mut self.settings.autosave, "Autosave after a short pause");
+                    ui.checkbox(
+                        &mut self.settings.check_updates,
+                        "Check GitHub for updates when the app starts",
+                    );
                     ui.horizontal(|ui| {
                         if ui.button("Save and reconnect").clicked() {
                             let _ = self.settings.save();
@@ -2362,6 +3221,55 @@ impl NovelQuillApp {
             }
             self.show_rename = open;
         }
+        if self.show_recovery {
+            let mut open = self.show_recovery;
+            let items = self
+                .project
+                .as_ref()
+                .and_then(|project| project.recovery_items().ok())
+                .unwrap_or_default();
+            let mut restore = None;
+            let mut discard = None;
+            egui::Window::new("Recover unsaved writing")
+                .open(&mut open)
+                .default_width(560.0)
+                .show(ctx, |ui| {
+                    ui.label(
+                        "These snapshots were captured before the documents were safely saved.",
+                    );
+                    if items.is_empty() {
+                        ui.label("No recovery snapshots remain.");
+                    }
+                    for (index, item) in items.iter().enumerate() {
+                        ui.group(|ui| {
+                            ui.strong(&item.relative_path);
+                            ui.small(format!(
+                                "{} words captured",
+                                item.content.split_whitespace().count()
+                            ));
+                            ui.horizontal(|ui| {
+                                if ui.button("Restore").clicked() {
+                                    restore = Some(index);
+                                }
+                                if ui.button("Discard").clicked() {
+                                    discard = Some(index);
+                                }
+                            });
+                        });
+                    }
+                });
+            if let Some(index) = restore {
+                self.restore_recovery_item(&items[index]);
+            } else if let Some(index) = discard {
+                self.discard_recovery_item(&items[index]);
+            }
+            self.show_recovery = open
+                && self
+                    .project
+                    .as_ref()
+                    .and_then(|project| project.recovery_items().ok())
+                    .is_some_and(|items| !items.is_empty());
+        }
         if self.show_trash {
             let mut open = self.show_trash;
             let items = self
@@ -2453,10 +3361,22 @@ impl NovelQuillApp {
                 .default_height(600.0)
                 .show(ctx, |ui| {
                     ui.small("This is the context and instruction sent to Ollama for the most recent generation.");
+                    let characters = self.prompt_preview.chars().count();
+                    ui.label(format!(
+                        "Model: {} · {characters} characters · approximately {} tokens · context limit {}",
+                        if self.settings.model.is_empty() {
+                            "not selected"
+                        } else {
+                            &self.settings.model
+                        },
+                        characters.div_ceil(4),
+                        self.settings.context_length
+                    ));
                     ui.add(
                         egui::TextEdit::multiline(&mut self.prompt_preview)
                             .font(egui::TextStyle::Monospace)
-                            .desired_rows(30),
+                            .desired_rows(30)
+                            .interactive(false),
                     );
                     if ui.button("Copy prompt").clicked() {
                         ui.ctx().copy_text(self.prompt_preview.clone());
@@ -2517,7 +3437,19 @@ impl NovelQuillApp {
 impl eframe::App for NovelQuillApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_ollama(ctx);
+        self.poll_updates(ctx);
         self.handle_shortcuts(ctx);
+        if self.last_recovery.elapsed() > Duration::from_millis(500) {
+            if let Some(project) = &self.project {
+                for document in self.documents.iter().filter(|document| document.is_dirty()) {
+                    if let Err(error) = project.write_recovery(document) {
+                        self.status = format!("Could not write recovery snapshot: {error}");
+                        break;
+                    }
+                }
+            }
+            self.last_recovery = Instant::now();
+        }
         if self.settings.autosave && self.last_edit.elapsed() > Duration::from_secs(2) {
             if self.documents.iter().any(Document::is_dirty) {
                 self.save_all();
@@ -2532,6 +3464,7 @@ impl eframe::App for NovelQuillApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             self.tabs(ui);
             ui.separator();
+            ui.add_space(2.0);
             self.editor(ui);
         });
         self.dialogs(ctx);
@@ -2546,11 +3479,20 @@ impl eframe::App for NovelQuillApp {
 fn configure_style(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
     style.visuals = egui::Visuals::dark();
-    style.visuals.panel_fill = Color32::from_rgb(25, 26, 29);
-    style.visuals.window_fill = Color32::from_rgb(31, 32, 36);
-    style.visuals.extreme_bg_color = Color32::from_rgb(19, 20, 23);
-    style.visuals.selection.bg_fill = Color32::from_rgb(74, 92, 116);
-    style.spacing.item_spacing = egui::vec2(8.0, 7.0);
+    style.visuals.panel_fill = Color32::from_rgb(23, 24, 27);
+    style.visuals.window_fill = Color32::from_rgb(30, 31, 35);
+    style.visuals.extreme_bg_color = Color32::from_rgb(18, 19, 22);
+    style.visuals.faint_bg_color = Color32::from_rgb(35, 36, 40);
+    style.visuals.selection.bg_fill = Color32::from_rgb(105, 84, 48);
+    style.visuals.selection.stroke.color = Color32::from_rgb(244, 222, 174);
+    style.visuals.window_corner_radius = egui::CornerRadius::same(8);
+    style.visuals.menu_corner_radius = egui::CornerRadius::same(6);
+    style.visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(4);
+    style.visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(4);
+    style.visuals.widgets.active.corner_radius = egui::CornerRadius::same(4);
+    style.spacing.item_spacing = egui::vec2(8.0, 8.0);
+    style.spacing.button_padding = egui::vec2(9.0, 5.0);
+    style.spacing.interact_size.y = 26.0;
     ctx.set_style(style);
 }
 
@@ -2675,6 +3617,47 @@ fn split_csv(value: &str) -> Vec<String> {
         .collect()
 }
 
+fn meaningful_terms(text: &str) -> HashSet<String> {
+    const STOP_WORDS: &[&str] = &[
+        "about", "after", "again", "also", "before", "being", "could", "every", "first", "from",
+        "have", "into", "just", "more", "other", "over", "said", "some", "than", "that", "their",
+        "there", "these", "they", "this", "through", "very", "what", "when", "where", "which",
+        "while", "with", "would", "your",
+    ];
+    text.split(|character: char| !character.is_alphanumeric() && character != '\'')
+        .map(str::to_lowercase)
+        .filter(|term| term.chars().count() >= 4)
+        .filter(|term| !STOP_WORDS.contains(&term.as_str()))
+        .collect()
+}
+
+fn best_relevant_excerpt(
+    text: &str,
+    query_terms: &HashSet<String>,
+    maximum_characters: usize,
+) -> (usize, String) {
+    let mut best = (0, String::new());
+    for paragraph in text
+        .split("\n\n")
+        .filter(|paragraph| !paragraph.trim().is_empty())
+    {
+        let terms = meaningful_terms(paragraph);
+        let score = terms.intersection(query_terms).count();
+        if score > best.0 {
+            let mut excerpt = paragraph
+                .trim()
+                .chars()
+                .take(maximum_characters)
+                .collect::<String>();
+            if paragraph.trim().chars().count() > maximum_characters {
+                excerpt.push('…');
+            }
+            best = (score, excerpt);
+        }
+    }
+    best
+}
+
 fn value_or_unknown(value: &str) -> &str {
     if value.trim().is_empty() {
         "unspecified"
@@ -2696,4 +3679,32 @@ fn remove_html_comments(text: &str) -> String {
     }
     output.push_str(remaining);
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relevant_excerpt_prefers_shared_story_terms() {
+        let query =
+            meaningful_terms("Mara entered the obsidian observatory with the star compass.");
+        let text = "A baker prepared bread for the village.\n\nMara hid the star compass beneath the obsidian observatory floor.";
+        let (score, excerpt) = best_relevant_excerpt(text, &query, 500);
+        assert!(score >= 4);
+        assert!(excerpt.contains("star compass"));
+        assert!(!excerpt.contains("baker"));
+    }
+
+    #[test]
+    fn relevant_excerpt_respects_character_limit() {
+        let query = meaningful_terms("observatory compass");
+        let (_, excerpt) = best_relevant_excerpt(
+            "The observatory contained a compass and many ancient instruments.",
+            &query,
+            20,
+        );
+        assert!(excerpt.chars().count() <= 21);
+        assert!(excerpt.ends_with('…'));
+    }
 }

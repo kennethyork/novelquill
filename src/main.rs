@@ -6,6 +6,7 @@ mod export;
 mod model;
 mod ollama;
 mod pdf;
+mod updates;
 
 use app::NovelQuillApp;
 

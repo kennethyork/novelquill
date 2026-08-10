@@ -4,12 +4,25 @@ version = "0.1.0"
 edition = "2024"
 description = "A local-first Markdown novel writer with Ollama assistance"
 license = "GPL-3.0-only"
+authors = ["Kenneth York"]
+homepage = "https://github.com/kennethyork/novelquill"
+repository = "https://github.com/kennethyork/novelquill"
+
+[package.metadata.packager]
+product-name = "Novel Quill Studio"
+identifier = "io.github.kennethyork.novelquill"
+before-packaging-command = "cargo build --release --locked"
+out-dir = "dist"
+license-file = "LICENSE"
+category = "Productivity"
+icons = ["assets/novel-quill-icon.png"]
 
 [dependencies]
 anyhow = "1.0"
 directories = "6.0"
 eframe = { version = "0.31", features = ["persistence"] }
 egui = "0.31"
+fs2 = "0.4.3"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 rfd = "0.15"
 serde = { version = "1.0", features = ["derive"] }

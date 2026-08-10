@@ -236,6 +236,10 @@ fn crc32(bytes: &[u8]) -> u32 {
 mod tests {
     use super::*;
 
+    fn contains(bytes: &[u8], needle: &[u8]) -> bool {
+        bytes.windows(needle.len()).any(|window| window == needle)
+    }
+
     #[test]
     fn crc_matches_standard_vector() {
         assert_eq!(crc32(b"123456789"), 0xcbf4_3926);
@@ -246,6 +250,72 @@ mod tests {
         let path = std::env::temp_dir().join(format!("novel-quill-{}.docx", std::process::id()));
         docx(&path, "Novel", "Author", &["# One\n\nText".into()]).unwrap();
         assert!(fs::read(&path).unwrap().starts_with(b"PK\x03\x04"));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn docx_contains_required_openxml_parts_and_escaped_text() {
+        let path = std::env::temp_dir().join(format!(
+            "novel-quill-conformance-{}.docx",
+            std::process::id()
+        ));
+        docx(&path, "A & B", "Author", &["# One\n\n<Conflict>".into()]).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        assert!(contains(&bytes, b"[Content_Types].xml"));
+        assert!(contains(&bytes, b"word/document.xml"));
+        assert!(contains(&bytes, b"A &amp; B"));
+        assert!(contains(&bytes, b"&lt;Conflict&gt;"));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn odt_contains_mimetype_content_and_manifest() {
+        let path = std::env::temp_dir().join(format!(
+            "novel-quill-conformance-{}.odt",
+            std::process::id()
+        ));
+        odt(&path, "Novel", "Author", &["# One\n\nText".into()]).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        assert!(contains(&bytes, b"application/vnd.oasis.opendocument.text"));
+        assert!(contains(&bytes, b"content.xml"));
+        assert!(contains(&bytes, b"META-INF/manifest.xml"));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn epub_contains_epub3_navigation_package_and_chapters() {
+        let path = std::env::temp_dir().join(format!(
+            "novel-quill-conformance-{}.epub",
+            std::process::id()
+        ));
+        epub(
+            &path,
+            "Novel",
+            "Author",
+            &["# One\n\nText".into(), "# Two\n\nMore".into()],
+        )
+        .unwrap();
+        let bytes = fs::read(&path).unwrap();
+        assert!(contains(&bytes, b"application/epub+zip"));
+        assert!(contains(&bytes, b"META-INF/container.xml"));
+        assert!(contains(&bytes, b"OEBPS/content.opf"));
+        assert!(contains(&bytes, b"OEBPS/nav.xhtml"));
+        assert!(contains(&bytes, b"chapter2.xhtml"));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn html_export_has_utf8_metadata_and_escapes_user_content() {
+        let path = std::env::temp_dir().join(format!(
+            "novel-quill-conformance-{}.html",
+            std::process::id()
+        ));
+        html(&path, "A & B", "<Author>", &["Danger & hope".into()]).unwrap();
+        let output = fs::read_to_string(&path).unwrap();
+        assert!(output.contains("<meta charset=\"utf-8\">"));
+        assert!(output.contains("A &amp; B"));
+        assert!(output.contains("&lt;Author&gt;"));
+        assert!(output.contains("Danger &amp; hope"));
         fs::remove_file(path).unwrap();
     }
 }

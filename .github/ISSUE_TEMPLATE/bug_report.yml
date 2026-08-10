@@ -1,0 +1,61 @@
+name: Bug report
+description: Report a reproducible Novel Quill Studio problem
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for helping make Novel Quill Studio safer. Do not attach private manuscript text.
+  - type: input
+    id: version
+    attributes:
+      label: Novel Quill version
+      placeholder: v0.1.0
+    validations:
+      required: true
+  - type: dropdown
+    id: operating-system
+    attributes:
+      label: Operating system
+      options:
+        - Linux
+        - Windows
+    validations:
+      required: true
+  - type: input
+    id: system-version
+    attributes:
+      label: Distribution or Windows version
+    validations:
+      required: true
+  - type: input
+    id: ollama
+    attributes:
+      label: Ollama version and model
+      description: Leave blank if the problem is unrelated to AI.
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      placeholder: Tell us exactly what to click or type.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Manuscript safety
+      options:
+        - label: I made a backup and removed private manuscript text from this report.
+          required: true

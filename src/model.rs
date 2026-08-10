@@ -1,7 +1,8 @@
 use anyhow::{Context, Result, bail};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::{
-    fs,
+    fs::{self, File, OpenOptions},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
@@ -69,6 +70,7 @@ pub struct Project {
     pub root: PathBuf,
     pub files: Vec<FileEntry>,
     pub manifest: ProjectManifest,
+    _lock: File,
 }
 
 impl Project {
@@ -76,6 +78,20 @@ impl Project {
         if !root.is_dir() {
             bail!("{} is not a folder", root.display());
         }
+        let novelquill_dir = root.join(".novelquill");
+        fs::create_dir_all(&novelquill_dir)?;
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(novelquill_dir.join("project.lock"))?;
+        lock.try_lock_exclusive().with_context(|| {
+            format!(
+                "{} is already open in another Novel Quill Studio window",
+                root.display()
+            )
+        })?;
         let manifest_path = root.join(".novelquill/project.json");
         let manifest = fs::read_to_string(&manifest_path)
             .ok()
@@ -92,6 +108,7 @@ impl Project {
             root,
             files: vec![],
             manifest,
+            _lock: lock,
         };
         project.refresh()?;
         project.save_manifest()?;
@@ -428,11 +445,122 @@ impl Project {
         Ok(())
     }
 
+    pub fn reorder_document_before(&mut self, source: &Path, target: &Path) -> Result<()> {
+        let source = self.relative_string(source);
+        let target = self.relative_string(target);
+        if source == target {
+            return Ok(());
+        }
+        let mut ordered = self
+            .manifest
+            .documents
+            .iter()
+            .filter(|meta| !meta.archived)
+            .map(|meta| (meta.path.clone(), meta.order))
+            .collect::<Vec<_>>();
+        ordered.sort_by_key(|(_, order)| *order);
+        let mut paths = ordered
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect::<Vec<_>>();
+        let Some(source_index) = paths.iter().position(|path| path == &source) else {
+            bail!("Dragged document is not in the project");
+        };
+        let moved = paths.remove(source_index);
+        let Some(target_index) = paths.iter().position(|path| path == &target) else {
+            bail!("Drop target is not in the project");
+        };
+        paths.insert(target_index, moved);
+        for (order, path) in paths.iter().enumerate() {
+            if let Some(meta) = self
+                .manifest
+                .documents
+                .iter_mut()
+                .find(|meta| &meta.path == path)
+            {
+                meta.order = order;
+            }
+        }
+        self.save_manifest()?;
+        self.refresh()
+    }
+
     pub fn save_document(&self, document: &mut Document) -> Result<()> {
         if document.is_dirty() && !document.saved_content.is_empty() {
             self.snapshot(document)?;
         }
-        document.save()
+        document.save()?;
+        self.clear_recovery(&document.path)
+    }
+
+    pub fn write_recovery(&self, document: &Document) -> Result<()> {
+        let relative_path = self.relative_string(&document.path);
+        let id = self
+            .document_meta(&document.path)
+            .map(|meta| meta.id.clone())
+            .unwrap_or_else(|| new_id("recovery"));
+        let item = RecoveryItem {
+            id: id.clone(),
+            relative_path,
+            content: document.content.clone(),
+            saved_at_millis: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        };
+        let bytes = serde_json::to_vec(&item)?;
+        atomic_write(
+            &self
+                .root
+                .join(".novelquill/recovery")
+                .join(format!("{id}.json")),
+            &bytes,
+        )
+    }
+
+    pub fn recovery_items(&self) -> Result<Vec<RecoveryItem>> {
+        let directory = self.root.join(".novelquill/recovery");
+        let Ok(entries) = fs::read_dir(directory) else {
+            return Ok(vec![]);
+        };
+        let mut items = entries
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| fs::read_to_string(entry.path()).ok())
+            .filter_map(|text| serde_json::from_str::<RecoveryItem>(&text).ok())
+            .collect::<Vec<_>>();
+        items.sort_by_key(|item| item.saved_at_millis);
+        Ok(items)
+    }
+
+    pub fn restore_recovery(&self, item: &RecoveryItem) -> Result<PathBuf> {
+        let path = self.root.join(&item.relative_path);
+        ensure_inside(&self.root, &path)?;
+        atomic_write(&path, item.content.as_bytes())?;
+        self.remove_recovery_file(&item.id)?;
+        Ok(path)
+    }
+
+    pub fn discard_recovery(&self, item: &RecoveryItem) -> Result<()> {
+        self.remove_recovery_file(&item.id)
+    }
+
+    fn clear_recovery(&self, path: &Path) -> Result<()> {
+        if let Some(id) = self.document_meta(path).map(|meta| meta.id.as_str()) {
+            self.remove_recovery_file(id)?;
+        }
+        Ok(())
+    }
+
+    fn remove_recovery_file(&self, id: &str) -> Result<()> {
+        let path = self
+            .root
+            .join(".novelquill/recovery")
+            .join(format!("{id}.json"));
+        match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
 
     pub fn snapshot(&self, document: &Document) -> Result<()> {
@@ -668,6 +796,22 @@ pub struct BuildProfile {
     pub include_comments: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PromptPreset {
+    pub name: String,
+    pub instructions: String,
+}
+
+impl Default for PromptPreset {
+    fn default() -> Self {
+        Self {
+            name: "New prompt".into(),
+            instructions: String::new(),
+        }
+    }
+}
+
 impl Default for BuildProfile {
     fn default() -> Self {
         Self {
@@ -692,6 +836,7 @@ pub struct ProjectManifest {
     pub documents: Vec<DocumentMeta>,
     pub codex: Vec<CodexEntry>,
     pub build_profiles: Vec<BuildProfile>,
+    pub prompt_presets: Vec<PromptPreset>,
     pub chat_messages: Vec<ChatMessage>,
     pub trash: Vec<TrashItem>,
 }
@@ -708,6 +853,7 @@ impl Default for ProjectManifest {
             documents: vec![],
             codex: vec![],
             build_profiles: vec![BuildProfile::default()],
+            prompt_presets: vec![],
             chat_messages: vec![],
             trash: vec![],
         }
@@ -719,6 +865,14 @@ pub struct TrashItem {
     pub id: String,
     pub original_path: String,
     pub stored_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoveryItem {
+    pub id: String,
+    pub relative_path: String,
+    pub content: String,
+    pub saved_at_millis: u128,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -757,10 +911,24 @@ pub struct Settings {
     pub ollama_url: String,
     pub model: String,
     pub temperature: f32,
+    pub top_p: f32,
+    pub repeat_penalty: f32,
+    pub context_length: u32,
+    pub max_output_tokens: i32,
+    pub include_style_guide: bool,
+    pub include_scene_metadata: bool,
+    pub include_previous_summaries: bool,
+    pub include_relevant_scenes: bool,
+    pub include_codex: bool,
+    pub previous_summary_limit: usize,
+    pub relevant_scene_limit: usize,
+    pub relevant_scene_excerpt_chars: usize,
+    pub codex_limit: usize,
     pub autosave: bool,
     pub last_project: Option<PathBuf>,
     pub target_words: usize,
     pub font_size: f32,
+    pub check_updates: bool,
 }
 
 impl Default for Settings {
@@ -769,10 +937,24 @@ impl Default for Settings {
             ollama_url: "http://127.0.0.1:11434".into(),
             model: String::new(),
             temperature: 0.7,
+            top_p: 0.9,
+            repeat_penalty: 1.1,
+            context_length: 16_384,
+            max_output_tokens: 1_024,
+            include_style_guide: true,
+            include_scene_metadata: true,
+            include_previous_summaries: true,
+            include_relevant_scenes: true,
+            include_codex: true,
+            previous_summary_limit: 8,
+            relevant_scene_limit: 3,
+            relevant_scene_excerpt_chars: 1_200,
+            codex_limit: 20,
             autosave: true,
             last_project: None,
             target_words: 80_000,
             font_size: 18.0,
+            check_updates: true,
         }
     }
 }
@@ -819,6 +1001,7 @@ mod tests {
         let project = Project::open(root.clone()).unwrap();
         assert!(project.files.iter().any(|f| f.path.ends_with("One.md")));
         assert!(!project.files.iter().any(|f| f.path.ends_with("cover.png")));
+        drop(project);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -839,11 +1022,74 @@ mod tests {
     }
 
     #[test]
+    fn advanced_ai_settings_are_backward_compatible() {
+        let settings: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(settings.context_length, 16_384);
+        assert_eq!(settings.max_output_tokens, 1_024);
+        assert!(settings.include_style_guide);
+        assert!(settings.include_codex);
+    }
+
+    #[test]
+    fn project_lock_prevents_concurrent_writers_and_releases_on_drop() {
+        let root = test_root("project-lock");
+        fs::create_dir_all(&root).unwrap();
+        let project = Project::open(root.clone()).unwrap();
+        assert!(Project::open(root.clone()).is_err());
+        drop(project);
+        let reopened = Project::open(root.clone()).unwrap();
+        drop(reopened);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovery_snapshot_can_be_restored_and_is_cleared_after_save() {
+        let root = test_root("recovery");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("scene.md");
+        fs::write(&path, "saved text").unwrap();
+        let project = Project::open(root.clone()).unwrap();
+        let mut document = Document::open(path.clone()).unwrap();
+        document.content = "unsaved recovered text".into();
+        project.write_recovery(&document).unwrap();
+        let items = project.recovery_items().unwrap();
+        assert_eq!(items.len(), 1);
+        project.restore_recovery(&items[0]).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "unsaved recovered text");
+
+        document.content = "new saved text".into();
+        project.write_recovery(&document).unwrap();
+        project.save_document(&mut document).unwrap();
+        assert!(project.recovery_items().unwrap().is_empty());
+        drop(project);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn project_persists_reusable_prompt_presets() {
+        let root = test_root("prompt-presets");
+        fs::create_dir_all(&root).unwrap();
+        let mut project = Project::open(root.clone()).unwrap();
+        project.manifest.prompt_presets.push(PromptPreset {
+            name: "Tighten prose".into(),
+            instructions: "Make the prose more concise.".into(),
+        });
+        project.save_manifest().unwrap();
+        drop(project);
+        let reopened = Project::open(root.clone()).unwrap();
+        assert_eq!(reopened.manifest.prompt_presets.len(), 1);
+        assert_eq!(reopened.manifest.prompt_presets[0].name, "Tighten prose");
+        drop(reopened);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn project_rejects_parent_directory_escape() {
         let root = test_root("escape");
         fs::create_dir_all(&root).unwrap();
         let mut project = Project::open(root.clone()).unwrap();
         assert!(project.create_document("../outside.md").is_err());
+        drop(project);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -860,8 +1106,10 @@ mod tests {
         document.content = "revised".into();
         project.save_document(&mut document).unwrap();
         assert_eq!(project.revisions(&path).len(), 1);
+        drop(project);
         let reopened = Project::open(root.clone()).unwrap();
         assert_eq!(reopened.document_meta(&path).unwrap().pov, "Mara");
+        drop(reopened);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -879,6 +1127,49 @@ mod tests {
             project.document_meta(&copy).unwrap().synopsis,
             "A discovery"
         );
+        drop(project);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn documents_can_be_reordered_by_drag_target() {
+        let root = test_root("drag-order");
+        fs::create_dir_all(&root).unwrap();
+        let first = root.join("first.md");
+        let second = root.join("second.md");
+        let third = root.join("third.md");
+        fs::write(&first, "first").unwrap();
+        fs::write(&second, "second").unwrap();
+        fs::write(&third, "third").unwrap();
+        let mut project = Project::open(root.clone()).unwrap();
+        project.reorder_document_before(&third, &first).unwrap();
+        let mut ordered = project.manifest.documents.iter().collect::<Vec<_>>();
+        ordered.sort_by_key(|meta| meta.order);
+        assert_eq!(ordered[0].path, "third.md");
+        drop(project);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn full_novel_scale_project_discovers_hundreds_of_scenes() {
+        let root = test_root("large-project");
+        fs::create_dir_all(root.join("Manuscript")).unwrap();
+        let paragraph = "A complete paragraph with character action, dialogue, setting, conflict, and meaningful story consequences. ";
+        for index in 0..250 {
+            fs::write(
+                root.join("Manuscript").join(format!("Scene {index:03}.md")),
+                paragraph.repeat(80),
+            )
+            .unwrap();
+        }
+        let mut project = Project::open(root.clone()).unwrap();
+        assert_eq!(
+            project.files.iter().filter(|entry| !entry.is_dir).count(),
+            250
+        );
+        project.refresh().unwrap();
+        assert_eq!(project.manifest.documents.len(), 250);
+        drop(project);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -896,6 +1187,7 @@ mod tests {
         let restored = project.restore_trash(0).unwrap();
         assert_eq!(restored, path);
         assert!(restored.exists());
+        drop(project);
         fs::remove_dir_all(root).unwrap();
     }
 }

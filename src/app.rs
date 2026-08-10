@@ -905,6 +905,18 @@ impl NovelQuillApp {
                     ui.checkbox(&mut self.left_panel, "Project sidebar");
                     ui.checkbox(&mut self.ai_panel, "Ollama assistant");
                     ui.checkbox(&mut self.focus_mode, "Focus mode");
+                    if ui
+                        .add_enabled(
+                            self.pinned_document.is_some(),
+                            egui::Button::new("Close document comparison"),
+                        )
+                        .clicked()
+                    {
+                        self.pinned_document = None;
+                        self.center_view = CenterView::Editor;
+                        self.status = "Closed side-by-side document comparison".into();
+                        ui.close_menu();
+                    }
                 });
                 ui.menu_button("Project", |ui| {
                     if ui
@@ -954,14 +966,6 @@ impl NovelQuillApp {
                 ui.selectable_value(&mut self.center_view, CenterView::Editor, "Write");
                 ui.selectable_value(&mut self.center_view, CenterView::Preview, "Preview");
                 ui.selectable_value(&mut self.center_view, CenterView::Split, "Split");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let title = self
-                        .project
-                        .as_ref()
-                        .map(Project::name)
-                        .unwrap_or_else(|| "No project".into());
-                    ui.label(RichText::new(title).strong());
-                });
             });
         });
     }
@@ -1074,6 +1078,7 @@ impl NovelQuillApp {
         let mut move_action = None;
         let mut duplicate_path = None;
         let mut pin_path = None;
+        let mut trash_active = false;
         egui::ScrollArea::vertical().show(ui, |ui| {
             for entry in entries {
                 let name = entry
@@ -1120,7 +1125,11 @@ impl NovelQuillApp {
                     }
                     if ui
                         .small_button("⇄")
-                        .on_hover_text("Open this copy side by side")
+                        .on_hover_text(if self.pinned_document.as_ref() == Some(&entry.path) {
+                            "Close this side-by-side comparison"
+                        } else {
+                            "Open this copy side by side"
+                        })
                         .clicked()
                     {
                         pin_path = Some(entry.path.clone());
@@ -1139,10 +1148,21 @@ impl NovelQuillApp {
                         if ui.small_button("↓").on_hover_text("Move later").clicked() {
                             move_action = Some((entry.path.clone(), 1));
                         }
+                        if ui
+                            .small_button("×")
+                            .on_hover_text("Move this document to recoverable Trash")
+                            .clicked()
+                        {
+                            trash_active = true;
+                        }
                     }
                 });
             }
         });
+        if trash_active {
+            self.trash_active_document();
+            return None;
+        }
         if let Some((path, direction)) = move_action
             && let Some(project) = &mut self.project
             && let Err(error) = project.move_document(&path, direction)
@@ -1164,6 +1184,12 @@ impl NovelQuillApp {
     }
 
     fn open_side_by_side(&mut self, path: PathBuf) {
+        if self.pinned_document.as_ref() == Some(&path) {
+            self.pinned_document = None;
+            self.center_view = CenterView::Editor;
+            self.status = "Closed side-by-side document comparison".into();
+            return;
+        }
         let previous_active = self.active;
         if !self.documents.iter().any(|document| document.path == path) {
             match Document::open(path.clone()) {
@@ -1682,6 +1708,7 @@ impl NovelQuillApp {
             });
             return;
         };
+        let mut close_comparison = false;
         if self.center_view != CenterView::Preview {
             let mut insert = None;
             let mut split = false;
@@ -1740,7 +1767,18 @@ impl NovelQuillApp {
                 if ui.button("History").clicked() {
                     self.show_revisions = true;
                 }
+                if self.center_view == CenterView::Split && self.pinned_document.is_some() {
+                    ui.separator();
+                    if ui.button("Close comparison ×").clicked() {
+                        close_comparison = true;
+                    }
+                }
             });
+            if close_comparison {
+                self.pinned_document = None;
+                self.center_view = CenterView::Editor;
+                self.status = "Closed side-by-side document comparison".into();
+            }
             if let Some(text) = insert {
                 self.insert_editor_text(text);
             }

@@ -207,12 +207,12 @@ fn generate(
 }
 
 fn connection_error(error: reqwest::Error) -> String {
-    if error.is_connect() {
-        "Could not reach Ollama. Start it with `ollama serve` and check the server URL.".into()
-    } else if error.is_timeout() {
+    if error.is_timeout() {
         "Ollama took too long to respond.".into()
     } else {
-        error.to_string()
+        format!(
+            "Could not reach Ollama. Start it with `ollama serve` and check the server URL. ({error})"
+        )
     }
 }
 

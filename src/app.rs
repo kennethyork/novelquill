@@ -2533,7 +2533,7 @@ impl NovelQuillApp {
                     };
                     let output = egui::Frame::new()
                         .fill(Color32::from_rgb(31, 32, 35))
-                        .stroke(egui::Stroke::new(1.0, Color32::from_rgb(50, 52, 57)))
+                        .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(50, 52, 57)))
                         .corner_radius(egui::CornerRadius::same(6))
                         .inner_margin(egui::Margin::symmetric(26, 28))
                         .show(ui, |ui| {

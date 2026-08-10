@@ -60,3 +60,7 @@ Novel Quill stores the manuscript and project metadata only in the folder you ch
 ## Current format guarantees
 
 The editor always reads and writes plain UTF-8 text. Preview intentionally handles the Markdown constructs most useful in prose—headings, paragraphs, block quotes, lists, scene breaks, and code markers—while leaving the source untouched.
+
+## License
+
+Novel Quill Studio is free software licensed under the [GNU General Public License version 3](LICENSE), identified by `GPL-3.0-only`. Modified versions distributed to others must remain under the GPL and provide their corresponding source code.

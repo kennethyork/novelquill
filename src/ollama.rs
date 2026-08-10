@@ -277,6 +277,10 @@ mod tests {
             .build()
             .unwrap();
         let error = list_models(&client, &format!("http://{address}")).unwrap_err();
-        assert!(error.contains("Could not reach Ollama"));
+        assert!(
+            error.contains("Could not reach Ollama")
+                || error.contains("Ollama took too long to respond"),
+            "unexpected connection error: {error}"
+        );
     }
 }

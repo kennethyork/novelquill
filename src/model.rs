@@ -908,6 +908,8 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    pub ollama_mode: OllamaMode,
+    pub allow_cloud_models_in_local_mode: bool,
     pub ollama_url: String,
     pub model: String,
     pub temperature: f32,
@@ -931,9 +933,20 @@ pub struct Settings {
     pub check_updates: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OllamaMode {
+    #[default]
+    Local,
+    Cloud,
+    Custom,
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            ollama_mode: OllamaMode::Local,
+            allow_cloud_models_in_local_mode: false,
             ollama_url: "http://127.0.0.1:11434".into(),
             model: String::new(),
             temperature: 0.7,
@@ -963,7 +976,16 @@ impl Settings {
     pub fn load() -> Self {
         settings_path()
             .and_then(|p| fs::read_to_string(p).ok())
-            .and_then(|text| serde_json::from_str(&text).ok())
+            .and_then(|text| {
+                let had_mode = serde_json::from_str::<serde_json::Value>(&text)
+                    .ok()
+                    .is_some_and(|value| value.get("ollama_mode").is_some());
+                let mut settings = serde_json::from_str::<Self>(&text).ok()?;
+                if !had_mode && settings.ollama_url != "http://127.0.0.1:11434" {
+                    settings.ollama_mode = OllamaMode::Custom;
+                }
+                Some(settings)
+            })
             .unwrap_or_default()
     }
 

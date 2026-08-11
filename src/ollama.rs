@@ -10,7 +10,10 @@ use std::{
 
 #[derive(Debug)]
 pub enum OllamaRequest {
-    ListModels { base_url: String },
+    ListModels {
+        base_url: String,
+        api_key: Option<String>,
+    },
     Generate(GenerateRequest),
 }
 
@@ -26,6 +29,7 @@ pub enum OllamaResponse {
 #[derive(Debug, Clone)]
 pub struct GenerateRequest {
     pub base_url: String,
+    pub api_key: Option<String>,
     pub model: String,
     pub system: String,
     pub prompt: String,
@@ -96,8 +100,8 @@ impl OllamaClient {
             };
             while let Ok(request) = request_rx.recv() {
                 match request {
-                    OllamaRequest::ListModels { base_url } => {
-                        let result = list_models(&client, &base_url);
+                    OllamaRequest::ListModels { base_url, api_key } => {
+                        let result = list_models(&client, &base_url, api_key.as_deref());
                         let _ = response_tx.send(result.unwrap_or_else(OllamaResponse::Error));
                     }
                     OllamaRequest::Generate(request) => {
@@ -137,13 +141,17 @@ impl OllamaClient {
 fn list_models(
     client: &reqwest::blocking::Client,
     base_url: &str,
+    api_key: Option<&str>,
 ) -> Result<OllamaResponse, String> {
-    let response = client
-        .get(format!("{}/api/tags", base_url.trim_end_matches('/')))
+    let mut request = client.get(format!("{}/api/tags", base_url.trim_end_matches('/')));
+    if let Some(api_key) = api_key.filter(|key| !key.trim().is_empty()) {
+        request = request.bearer_auth(api_key.trim());
+    }
+    let response = request
         .send()
         .map_err(connection_error)?
         .error_for_status()
-        .map_err(|e| e.to_string())?
+        .map_err(http_error)?
         .json::<TagsResponse>()
         .map_err(|e| e.to_string())?;
     Ok(OllamaResponse::Models(
@@ -170,16 +178,24 @@ fn generate(
             num_predict: request.max_output_tokens,
         },
     };
-    let response = client
+    let mut http_request = client
         .post(format!(
             "{}/api/generate",
             request.base_url.trim_end_matches('/')
         ))
-        .json(&body)
+        .json(&body);
+    if let Some(api_key) = request
+        .api_key
+        .as_deref()
+        .filter(|key| !key.trim().is_empty())
+    {
+        http_request = http_request.bearer_auth(api_key.trim());
+    }
+    let response = http_request
         .send()
         .map_err(connection_error)?
         .error_for_status()
-        .map_err(|e| e.to_string())?;
+        .map_err(http_error)?;
     for line in BufReader::new(response).lines() {
         if cancelled.load(Ordering::Relaxed) {
             let _ = sender.send(OllamaResponse::Cancelled);
@@ -216,6 +232,14 @@ fn connection_error(error: reqwest::Error) -> String {
     }
 }
 
+fn http_error(error: reqwest::Error) -> String {
+    if error.status() == Some(reqwest::StatusCode::UNAUTHORIZED) {
+        "Ollama rejected the credentials. Check your Cloud API key and try again.".into()
+    } else {
+        format!("Ollama returned an error. ({error})")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,7 +270,13 @@ mod tests {
             let (mut stream, _) = listener.accept().unwrap();
             let mut request = [0_u8; 2_048];
             let read = stream.read(&mut request).unwrap();
-            assert!(String::from_utf8_lossy(&request[..read]).contains("GET /api/tags"));
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(request.contains("GET /api/tags"));
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer test-key")
+            );
             let body = r#"{"models":[{"name":"qwen-test:latest"}]}"#;
             write!(
                 stream,
@@ -259,7 +289,8 @@ mod tests {
             .timeout(std::time::Duration::from_secs(2))
             .build()
             .unwrap();
-        let response = list_models(&client, &format!("http://{address}")).unwrap();
+        let response =
+            list_models(&client, &format!("http://{address}"), Some("test-key")).unwrap();
         match response {
             OllamaResponse::Models(models) => assert_eq!(models, ["qwen-test:latest"]),
             _ => panic!("expected model response"),
@@ -276,7 +307,7 @@ mod tests {
             .timeout(std::time::Duration::from_secs(2))
             .build()
             .unwrap();
-        let error = list_models(&client, &format!("http://{address}")).unwrap_err();
+        let error = list_models(&client, &format!("http://{address}"), None).unwrap_err();
         assert!(
             error.contains("Could not reach Ollama")
                 || error.contains("Ollama took too long to respond"),

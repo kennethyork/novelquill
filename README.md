@@ -21,7 +21,8 @@ A local-first desktop novel-writing studio built in Rust. Manuscripts remain ord
 - **Generation safety and history:** reopen the last 20 responses, edit every suggestion before insertion, undo AI edits, and prevent stale generations from overwriting a document changed since the request began.
 - **Handwritten vs AI review:** preserve the complete handwritten document beside a complete, editable AI-assisted version. Cursor continuations and selection rewrites are composed into the cloned AI document first; the handwritten version is untouched until explicitly replaced. Applied AI versions have a dedicated one-click undo stack.
 - **Publishing:** filter manuscript content through a saved build profile and export Markdown, PDF, DOCX, ODT, EPUB or styled HTML.
-- **Preferences:** Ollama endpoint/model, creativity, font size, autosave and novel word target, with automatic last-project reopening.
+- **Private AI connections:** choose local Ollama, authenticated Ollama Cloud, or a custom server. Local mode blocks `-cloud` models unless explicitly allowed, and cloud credentials remain in memory instead of being written to the project or settings file.
+- **Preferences:** Ollama connection/model, creativity, font size, autosave and novel word target, with automatic last-project reopening.
 
 ## Run
 
@@ -42,7 +43,7 @@ Tagged releases automatically build tested binaries for Linux and Windows throug
 
 Release tags produce Linux AppImage and Debian installers plus Windows NSIS and MSI installers. Every release includes SHA-256 checksums and a keyless Sigstore signature. Windows Authenticode signing activates automatically after the repository secrets `WINDOWS_CERTIFICATE_BASE64` and `WINDOWS_CERTIFICATE_PASSWORD` are configured.
 
-Open a folder containing `.md`, `.markdown`, or `.txt` files. The default Ollama endpoint is `http://127.0.0.1:11434` and can be changed in Settings.
+Open a folder containing `.md`, `.markdown`, or `.txt` files. Local mode uses `http://127.0.0.1:11434`. Settings also offers direct Ollama Cloud access with a session-only API key, plus custom Ollama-compatible servers. Set `OLLAMA_API_KEY` before launching if you do not want to paste the key each session.
 
 ## Keyboard shortcuts
 
@@ -61,7 +62,7 @@ Open a folder containing `.md`, `.markdown`, or `.txt` files. The default Ollama
 
 ## Data and privacy
 
-Novel Quill stores the manuscript and project metadata only in the folder you choose. Revision snapshots live under `.novelquill/history`. Global settings contain the last project path, Ollama endpoint, selected model and editor preferences. With the default endpoint, AI requests never leave your computer. If you configure a remote endpoint, the context shown by **Prompt preview** is sent to that server.
+Novel Quill stores the manuscript and project metadata only in the folder you choose. Revision snapshots live under `.novelquill/history`. Global settings contain the last project path, Ollama connection mode, custom endpoint, selected model and editor preferences. API keys are held in process memory only and are never saved by Novel Quill. In local mode, AI requests go to the Ollama service on your computer. Cloud and custom modes send only the context shown by **Prompt preview** to the selected server.
 
 When enabled, the update checker sends only the installed version and a standard application identifier to GitHub's public Releases API. It never sends project paths or manuscript content. Updates open the signed GitHub release for deliberate installation rather than silently replacing the running executable.
 

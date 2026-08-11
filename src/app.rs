@@ -1,7 +1,7 @@
 use crate::{
     model::{
-        ChatMessage, CodexEntry, Document, DocumentKind, Project, PromptPreset, RecoveryItem,
-        Settings,
+        ChatMessage, CodexEntry, Document, DocumentKind, OllamaMode, Project, PromptPreset,
+        RecoveryItem, Settings,
     },
     ollama::{GenerateRequest, OllamaClient, OllamaRequest, OllamaResponse},
     updates::{UpdateChecker, UpdateStatus},
@@ -111,6 +111,7 @@ pub struct NovelQuillApp {
     documents: Vec<Document>,
     active: Option<usize>,
     settings: Settings,
+    ollama_api_key: String,
     ollama: OllamaClient,
     updates: UpdateChecker,
     update_available: Option<(String, String)>,
@@ -198,9 +199,9 @@ impl NovelQuillApp {
             .and_then(|project| project.recovery_items().ok())
             .is_some_and(|items| !items.is_empty());
         let ollama = OllamaClient::new();
-        ollama.send(OllamaRequest::ListModels {
-            base_url: settings.ollama_url.clone(),
-        });
+        let ollama_api_key = std::env::var("OLLAMA_API_KEY").unwrap_or_default();
+        let (base_url, api_key) = ollama_connection(&settings, &ollama_api_key);
+        ollama.send(OllamaRequest::ListModels { base_url, api_key });
         let updates = UpdateChecker::new();
         if settings.check_updates {
             updates.check();
@@ -210,6 +211,7 @@ impl NovelQuillApp {
             documents: vec![],
             active: None,
             settings,
+            ollama_api_key,
             ollama,
             updates,
             update_available: None,
@@ -447,6 +449,19 @@ impl NovelQuillApp {
         if self.ai_busy {
             return;
         }
+        if self.settings.ollama_mode == OllamaMode::Cloud && self.ollama_api_key.trim().is_empty() {
+            self.status = "Add an Ollama Cloud API key in Settings first".into();
+            return;
+        }
+        if self.settings.ollama_mode == OllamaMode::Local
+            && is_cloud_model(&self.settings.model)
+            && !self.settings.allow_cloud_models_in_local_mode
+        {
+            self.status =
+                "This cloud model is blocked by Local-only mode. Enable it in Settings first"
+                    .into();
+            return;
+        }
         if self.settings.model.is_empty() {
             self.status = "Choose an Ollama model first".into();
             return;
@@ -558,7 +573,8 @@ impl NovelQuillApp {
         self.ai_busy = true;
         self.status = "Ollama is writing…".into();
         let request = GenerateRequest {
-            base_url: self.settings.ollama_url.clone(),
+            base_url: ollama_connection(&self.settings, &self.ollama_api_key).0,
+            api_key: ollama_connection(&self.settings, &self.ollama_api_key).1,
             model: self.settings.model.clone(),
             system: SYSTEM_PROMPT.into(),
             prompt,
@@ -2579,8 +2595,21 @@ impl NovelQuillApp {
                     }
                 });
             });
+            let connection_label = match self.settings.ollama_mode {
+                OllamaMode::Local
+                    if is_cloud_model(&self.settings.model)
+                        && self.settings.allow_cloud_models_in_local_mode =>
+                {
+                    "LOCAL DAEMON → CLOUD MODEL · context may leave this computer"
+                }
+                OllamaMode::Local => "LOCAL-ONLY · cloud models are blocked",
+                OllamaMode::Cloud => "CLOUD · selected context is sent to Ollama Cloud",
+                OllamaMode::Custom => {
+                    "CUSTOM SERVER · selected context is sent to that server"
+                }
+            };
             ui.label(
-                RichText::new("Local writing help · active document only")
+                RichText::new(connection_label)
                     .small()
                     .color(Color32::from_rgb(145, 150, 160)),
             );
@@ -2589,7 +2618,10 @@ impl NovelQuillApp {
                     for model in &self.models { ui.selectable_value(&mut self.settings.model, model.clone(), model); }
                 });
                 if ui.small_button("↻").on_hover_text("Reconnect and refresh models").clicked() {
-                    self.ollama.send(OllamaRequest::ListModels { base_url: self.settings.ollama_url.clone() });
+                    let (base_url, api_key) =
+                        ollama_connection(&self.settings, &self.ollama_api_key);
+                    self.ollama
+                        .send(OllamaRequest::ListModels { base_url, api_key });
                     self.status = "Connecting to Ollama…".into();
                 }
             });
@@ -2749,7 +2781,10 @@ impl NovelQuillApp {
             if context_changed {
                 let _ = self.settings.save();
             }
+            let has_credentials = self.settings.ollama_mode != OllamaMode::Cloud
+                || !self.ollama_api_key.trim().is_empty();
             let ready = self.active.is_some() && !self.ai_busy && !self.settings.model.is_empty()
+                && has_credentials
                 && (!matches!(self.ai_action, AiAction::Custom | AiAction::Chat)
                     || !self.ai_prompt.trim().is_empty());
             ui.horizontal(|ui| {
@@ -2849,7 +2884,12 @@ impl NovelQuillApp {
                     });
             }
             ui.add_space(8.0);
-            ui.small("Your manuscript is sent only to the configured Ollama server. With the default URL, it remains on this computer.");
+            ui.small(match self.settings.ollama_mode {
+                OllamaMode::Local if self.settings.allow_cloud_models_in_local_mode => "Requests go to the local Ollama service. If you select a model ending in `-cloud`, Ollama may send the displayed prompt context to its cloud service.",
+                OllamaMode::Local => "Local-only guard is active: Novel Quill blocks models ending in `-cloud` so manuscript context stays on this computer.",
+                OllamaMode::Cloud => "Cloud mode: only the context visible in Prompt preview is sent. The API key is kept in memory and never saved by Novel Quill.",
+                OllamaMode::Custom => "Custom mode: only the context visible in Prompt preview is sent to the configured server.",
+            });
         });
     }
 
@@ -2975,8 +3015,44 @@ impl NovelQuillApp {
                 .open(&mut open)
                 .resizable(false)
                 .show(ctx, |ui| {
-                    ui.label("Ollama server URL");
-                    ui.text_edit_singleline(&mut self.settings.ollama_url);
+                    ui.label("Ollama connection");
+                    egui::ComboBox::from_id_salt("ollama-mode")
+                        .selected_text(match self.settings.ollama_mode {
+                            OllamaMode::Local => "Local Ollama",
+                            OllamaMode::Cloud => "Ollama Cloud",
+                            OllamaMode::Custom => "Custom server",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.settings.ollama_mode, OllamaMode::Local, "Local Ollama");
+                            ui.selectable_value(&mut self.settings.ollama_mode, OllamaMode::Cloud, "Ollama Cloud");
+                            ui.selectable_value(&mut self.settings.ollama_mode, OllamaMode::Custom, "Custom server");
+                        });
+                    match self.settings.ollama_mode {
+                        OllamaMode::Local => {
+                            ui.small("Uses http://127.0.0.1:11434. No API key is required.");
+                            ui.checkbox(
+                                &mut self.settings.allow_cloud_models_in_local_mode,
+                                "Allow cloud models through local Ollama",
+                            );
+                            ui.small("Off by default so a local project cannot silently use a cloud model.");
+                        }
+                        OllamaMode::Cloud => {
+                            ui.label("Ollama Cloud API key");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.ollama_api_key)
+                                    .password(true)
+                                    .hint_text("Paste key for this session"),
+                            );
+                            ui.small("Kept in memory only. Alternatively, set OLLAMA_API_KEY before starting the app.");
+                            if ui.small_button("Forget key").clicked() {
+                                self.ollama_api_key.clear();
+                            }
+                        }
+                        OllamaMode::Custom => {
+                            ui.label("Ollama server URL");
+                            ui.text_edit_singleline(&mut self.settings.ollama_url);
+                        }
+                    }
                     ui.add(
                         egui::Slider::new(&mut self.settings.temperature, 0.0..=1.5)
                             .text("Creativity"),
@@ -3019,9 +3095,10 @@ impl NovelQuillApp {
                     ui.horizontal(|ui| {
                         if ui.button("Save and reconnect").clicked() {
                             let _ = self.settings.save();
-                            self.ollama.send(OllamaRequest::ListModels {
-                                base_url: self.settings.ollama_url.clone(),
-                            });
+                            let (base_url, api_key) =
+                                ollama_connection(&self.settings, &self.ollama_api_key);
+                            self.ollama
+                                .send(OllamaRequest::ListModels { base_url, api_key });
                             self.status = "Settings saved; connecting…".into();
                         }
                     });
@@ -3666,6 +3743,24 @@ fn value_or_unknown(value: &str) -> &str {
     }
 }
 
+fn ollama_connection(settings: &Settings, api_key: &str) -> (String, Option<String>) {
+    match settings.ollama_mode {
+        OllamaMode::Local => ("http://127.0.0.1:11434".into(), None),
+        OllamaMode::Cloud => (
+            "https://ollama.com".into(),
+            (!api_key.trim().is_empty()).then(|| api_key.trim().to_owned()),
+        ),
+        OllamaMode::Custom => (
+            settings.ollama_url.trim().trim_end_matches('/').to_owned(),
+            None,
+        ),
+    }
+}
+
+fn is_cloud_model(model: &str) -> bool {
+    model.trim().to_ascii_lowercase().ends_with("-cloud")
+}
+
 fn remove_html_comments(text: &str) -> String {
     let mut output = String::new();
     let mut remaining = text;
@@ -3684,6 +3779,36 @@ fn remove_html_comments(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ollama_modes_route_without_leaking_cloud_credentials() {
+        let mut settings = Settings::default();
+        assert_eq!(
+            ollama_connection(&settings, "secret"),
+            ("http://127.0.0.1:11434".into(), None)
+        );
+
+        settings.ollama_mode = OllamaMode::Cloud;
+        assert_eq!(
+            ollama_connection(&settings, "  secret  "),
+            ("https://ollama.com".into(), Some("secret".into()))
+        );
+        assert!(!serde_json::to_string(&settings).unwrap().contains("secret"));
+
+        settings.ollama_mode = OllamaMode::Custom;
+        settings.ollama_url = "https://writer.example/".into();
+        assert_eq!(
+            ollama_connection(&settings, "secret"),
+            ("https://writer.example".into(), None)
+        );
+    }
+
+    #[test]
+    fn cloud_models_are_identified_for_the_local_only_guard() {
+        assert!(is_cloud_model("gpt-oss:120b-cloud"));
+        assert!(is_cloud_model("QWEN3-CLOUD"));
+        assert!(!is_cloud_model("qwen3:8b"));
+    }
 
     #[test]
     fn relevant_excerpt_prefers_shared_story_terms() {
